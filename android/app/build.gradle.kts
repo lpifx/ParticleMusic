@@ -87,4 +87,5 @@ flutter {
 
 dependencies {
     implementation("com.github.HChenX:SuperLyricApi:3.4")
+    testImplementation("junit:junit:4.13.2")
 }
