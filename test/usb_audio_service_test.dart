@@ -409,15 +409,15 @@ void main() {
 
     final report = await service.getDiagnosticsReport();
 
-    expect(report, startsWith('Sylvakru USB 诊断报告 v1'));
-    expect(report, contains('App 版本'));
+    expect(report, startsWith('Sylvakru USB Diagnostics Report v1'));
+    expect(report, contains('App version'));
     expect(report, contains('0x2972 / 0x0047'));
     expect(report, contains('****9F2A'));
-    expect(report, contains('## 原始描述符 (hex dump)'));
+    expect(report, contains('## Raw descriptors (hex dump)'));
     expect(report, contains('0000: 12 01 00 02'));
     expect(report, contains('alt=1/max=294/bits=32'));
-    expect(report, contains('UAC2 时钟源 id: 41'));
-    expect(report, contains('## 偏好快照'));
+    expect(report, contains('UAC2 clock source id: 41'));
+    expect(report, contains('## Preferences snapshot'));
     expect(report, contains('open ok'));
     expect(report, contains('native line'));
   });
@@ -425,8 +425,8 @@ void main() {
   test('buildUsbDiagnosticsReport handles missing device data', () {
     final report = buildUsbDiagnosticsReport(const {}, platformSupported: true);
 
-    expect(report, startsWith('Sylvakru USB 诊断报告 v1'));
-    expect(report, contains('未检测到 USB 音频设备。'));
-    expect(report, contains('描述符不可用。'));
+    expect(report, startsWith('Sylvakru USB Diagnostics Report v1'));
+    expect(report, contains('No USB audio device detected.'));
+    expect(report, contains('Descriptors unavailable.'));
   });
 }

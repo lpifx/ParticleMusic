@@ -701,85 +701,87 @@ String buildUsbDiagnosticsReport(
   bool platformSupported = true,
 }) {
   final buffer = StringBuffer();
-  buffer.writeln('Sylvakru USB 诊断报告 v1');
+  buffer.writeln('Sylvakru USB Diagnostics Report v1');
 
   final error = native['error'];
   if (error != null) {
     buffer.writeln();
-    buffer.writeln('> 采集原生数据失败: $error');
+    buffer.writeln('> Failed to collect native data: $error');
   }
 
-  // 1. 环境
+  // 1. Environment
   buffer.writeln();
-  buffer.writeln('## 环境');
-  buffer.writeln('- App 版本: $versionNumber');
+  buffer.writeln('## Environment');
+  buffer.writeln('- App version: $versionNumber');
   if (!platformSupported) {
-    buffer.writeln('- 平台: 非 Android（原生 USB 数据不可用）');
+    buffer.writeln('- Platform: non-Android (native USB data unavailable)');
   } else {
-    final release = native['androidRelease'] ?? '未知';
-    final sdk = _asInt(native['androidSdk']) ?? '未知';
+    final release = native['androidRelease'] ?? 'unknown';
+    final sdk = _asInt(native['androidSdk']) ?? 'unknown';
     buffer.writeln('- Android: $release (SDK $sdk)');
     buffer.writeln(
-      '- 机型: ${'${native['manufacturer'] ?? '未知'} ${native['model'] ?? ''}'.trim()}',
+      '- Device: ${'${native['manufacturer'] ?? 'unknown'} ${native['model'] ?? ''}'.trim()}',
     );
   }
-  buffer.writeln('- 生成时间: ${_formatTimestamp(native['generatedAtMs'])}');
+  buffer.writeln('- Generated at: ${_formatTimestamp(native['generatedAtMs'])}');
 
-  // 2. USB 设备标识
+  // 2. USB device identity
   buffer.writeln();
-  buffer.writeln('## USB 设备标识');
+  buffer.writeln('## USB device identity');
   final device = native['device'];
   if (device is Map) {
     final d = device.cast<String, Object?>();
     buffer.writeln(
       '- VID/PID: ${d['vendorIdHex'] ?? d['vendorId']} / ${d['productIdHex'] ?? d['productId']}',
     );
-    buffer.writeln('- 厂商: ${d['manufacturerName'] ?? '未知'}');
-    buffer.writeln('- 产品: ${d['productName'] ?? '未知'}');
+    buffer.writeln('- Manufacturer: ${d['manufacturerName'] ?? 'unknown'}');
+    buffer.writeln('- Product: ${d['productName'] ?? 'unknown'}');
     buffer.writeln(
       '- deviceClass/subclass: ${d['deviceClass']} / ${d['deviceSubclass']}',
     );
     buffer.writeln(
-      '- 接口总数 / Audio 接口数: ${d['interfaceCount']} / ${d['audioInterfaceCount']}',
+      '- Interfaces / audio interfaces: ${d['interfaceCount']} / ${d['audioInterfaceCount']}',
     );
-    buffer.writeln('- 序列号(脱敏): ${d['serialTail'] ?? '不可用'}');
+    buffer.writeln('- Serial (masked): ${d['serialTail'] ?? 'unavailable'}');
     buffer.writeln(
-      '- USB 权限: ${native['permissionGranted'] == true ? '已授权' : '未授权'}',
+      '- USB permission: ${native['permissionGranted'] == true ? 'granted' : 'denied'}',
     );
-    buffer.writeln('> 序列号仅显示末 4 位，不包含完整序列号。');
+    buffer.writeln('> Only the last 4 digits of the serial are shown.');
   } else {
-    buffer.writeln('- 未检测到 USB 音频设备。');
+    buffer.writeln('- No USB audio device detected.');
   }
 
   final diagnostics =
       (native['diagnostics'] as Map?)?.cast<String, Object?>() ?? const {};
 
-  // 3. 原始描述符 hex dump（离线还原设备行为的核心数据）
+  // 3. Raw descriptors hex dump
   buffer.writeln();
-  buffer.writeln('## 原始描述符 (hex dump)');
+  buffer.writeln('## Raw descriptors (hex dump)');
   final hex = diagnostics['rawDescriptorsHex'];
   if (hex is String && hex.isNotEmpty) {
-    buffer.writeln('长度: ${diagnostics['rawDescriptorLength'] ?? '未知'} bytes');
+    buffer.writeln(
+      'Length: ${diagnostics['rawDescriptorLength'] ?? 'unknown'} bytes',
+    );
     buffer.writeln('```');
     buffer.writeln(hex);
     buffer.writeln('```');
   } else {
-    buffer.writeln('- ${diagnostics['message'] ?? '描述符不可用。'}');
+    buffer.writeln('- ${diagnostics['message'] ?? 'Descriptors unavailable.'}');
   }
 
-  // 4. App 解析结果
+  // 4. App parse result
   buffer.writeln();
-  buffer.writeln('## App 解析结果');
-  buffer.writeln('### AS 格式');
+  buffer.writeln('## App parse result');
+  buffer.writeln('### AS formats');
   _writeListSection(buffer, diagnostics['streamingFormats']);
-  buffer.writeln('### 输出候选 (alt/maxPacket/attr/feedback/bits/format)');
+  buffer.writeln('### Output candidates (alt/maxPacket/attr/feedback/bits/format)');
   _writeListSection(buffer, diagnostics['outputCandidates']);
-  buffer.writeln('- UAC2 时钟源 id: ${diagnostics['clockSourceId'] ?? '未知'}');
-  buffer.writeln('- 最近一次 probe: ${native['lastProbe'] ?? '无'}');
+  buffer.writeln('- UAC2 clock source id: ${diagnostics['clockSourceId'] ?? 'unknown'}');
+  buffer.writeln('- Last probe: ${native['lastProbe'] ?? 'none'}');
 
-  // 5. 系统侧能力
+  // 5. System-side capability
   buffer.writeln();
-  buffer.writeln('## 系统侧能力');
+  buffer.writeln('## System-side capability');
   final status = (native['systemStatus'] as Map?)?.cast<String, Object?>();
   final devices = status?['devices'];
   if (devices is List && devices.isNotEmpty) {
@@ -787,22 +789,22 @@ String buildUsbDiagnosticsReport(
       buffer.writeln('- $dev');
     }
   } else {
-    buffer.writeln('- 无 USB 音频输出设备。');
+    buffer.writeln('- No USB audio output device.');
   }
 
-  // 6. 偏好快照
+  // 6. Preferences snapshot
   buffer.writeln();
-  buffer.writeln('## 偏好快照');
+  buffer.writeln('## Preferences snapshot');
   usbAudioPreferences.toMap().forEach((key, value) {
     buffer.writeln('- $key: $value');
   });
 
-  // 7. 运行状态快照
+  // 7. Runtime state snapshot
   buffer.writeln();
-  buffer.writeln('## 运行状态快照');
+  buffer.writeln('## Runtime state snapshot');
   final state = usbExclusivePlaybackStateNotifier.value;
   buffer.writeln(
-    '- 独占: active=${state.active}, playing=${state.playing}, '
+    '- Exclusive: active=${state.active}, playing=${state.playing}, '
     'format=${state.format}, sampleRate=${state.sampleRate}, '
     'bitDepth=${state.bitDepth}, position=${state.position.inMilliseconds}ms',
   );
@@ -817,9 +819,9 @@ String buildUsbDiagnosticsReport(
     'underrun=${telemetry.underrunCount}',
   );
 
-  // 8. 最近日志
+  // 8. Recent logs
   buffer.writeln();
-  buffer.writeln('## 最近日志 (Kotlin/native)');
+  buffer.writeln('## Recent logs (Kotlin/native)');
   _writeLogLines(buffer, native['logs']);
   final nativeLog = native['nativeLogcat'];
   if (nativeLog is List && nativeLog.isNotEmpty) {
@@ -829,10 +831,10 @@ String buildUsbDiagnosticsReport(
   }
 
   buffer.writeln();
-  buffer.writeln('## 最近日志 (Dart)');
+  buffer.writeln('## Recent logs (Dart)');
   final dartLogs = logger.tailContaining('usb', max: 200);
   if (dartLogs.isEmpty) {
-    buffer.writeln('（无）');
+    buffer.writeln('(none)');
   } else {
     for (final l in dartLogs) {
       buffer.writeln(l);
@@ -848,7 +850,7 @@ void _writeListSection(StringBuffer buffer, Object? value) {
       buffer.writeln('- $item');
     }
   } else {
-    buffer.writeln('- 无');
+    buffer.writeln('- none');
   }
 }
 
@@ -858,7 +860,7 @@ void _writeLogLines(StringBuffer buffer, Object? value) {
       buffer.writeln(line.toString());
     }
   } else {
-    buffer.writeln('（无）');
+    buffer.writeln('(none)');
   }
 }
 
