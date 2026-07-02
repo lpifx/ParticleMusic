@@ -803,8 +803,9 @@ class UsbExclusiveAudioEngine(
 
     /**
      * 配置 DAC 时钟到 [sampleRate]。返回 null 表示可以继续；返回非 null 的原因字符串表示
-     * 校验到时钟与请求不一致（GET_CUR 读回值 ≠ 请求值），调用方应据此回退系统输出，避免变调/欠载。
-     * 注意：仅在 GET_CUR 明确读回成功且不等于请求值时才判失败；读不回（设备不支持 GET_CUR）时不阻断。
+     * 校验到时钟与请求不一致（GET_CUR 读回一个有效且不同的采样率），调用方应据此回退系统输出。
+     * 注意：很多 DAC（如 Macaron）SET_CUR 成功但 GET_CUR 恒返回 0，属于“不报告实际值”，
+     * 不能当成不一致——否则会把本可正常独占的设备误判成失败。只有读回“有效非零且不同”才判失败。
      */
     private fun configureUsbAudioClock(
         connection: UsbDeviceConnection,
@@ -857,7 +858,7 @@ class UsbExclusiveAudioEngine(
                     controlInterfaceNumber,
                     "after",
                 )
-                if (readBack != null && readBack != sampleRate) {
+                if (readBack != null && readBack > 0 && readBack != sampleRate) {
                     UsbDiagnostics.w(
                         tag,
                         "UAC2 clock mismatch: requested=$sampleRate readBack=$readBack; " +
