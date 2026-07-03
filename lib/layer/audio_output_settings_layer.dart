@@ -814,27 +814,40 @@ class _AudioOutputSettingsLayerState extends State<AudioOutputSettingsLayer> {
     return ValueListenableBuilder<MyAudioMetadata?>(
       valueListenable: currentSongNotifier,
       builder: (context, song, _) {
-        final channel = _channelCountLabel(status);
-        return Padding(
-          padding: const EdgeInsets.fromLTRB(16, 16, 16, 18),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              _formatMetricRow(_l10n.sourceFile, [
-                _sourceFormatLabel(song),
-                formatSampleRate(song?.samplerate, _l10n),
-                channel,
-                _compactDepthLabel(status),
-              ]),
-              const SizedBox(height: 24),
-              _formatMetricRow(_l10n.dacEndpoint, [
-                'PCM',
-                formatOutputSampleRate(status, _l10n),
-                channel,
-                _compactDepthLabel(status),
-              ]),
-            ],
-          ),
+        return ValueListenableBuilder<UsbExclusivePlaybackState>(
+          valueListenable: usbExclusivePlaybackStateNotifier,
+          builder: (context, exclusive, _) {
+            final channel = _channelCountLabel(status);
+            // DoP 独占时端点收到的是封装 DSD 的 24-bit PCM 帧（帧率 = DSD 速率 ÷ 16），
+            // 不能按源文件的 DSD 速率 / 1-bit 展示
+            final dopActive =
+                exclusive.active &&
+                exclusive.sampleRate != null &&
+                (exclusive.format?.contains('(DoP)') ?? false);
+            return Padding(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 18),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _formatMetricRow(_l10n.sourceFile, [
+                    _sourceFormatLabel(song),
+                    formatSampleRate(song?.samplerate, _l10n),
+                    channel,
+                    song?.isDsd == true ? '1-bit' : _compactDepthLabel(status),
+                  ]),
+                  const SizedBox(height: 24),
+                  _formatMetricRow(_l10n.dacEndpoint, [
+                    dopActive ? 'DoP' : 'PCM',
+                    dopActive
+                        ? formatSampleRate(exclusive.sampleRate! ~/ 16, _l10n)
+                        : formatOutputSampleRate(status, _l10n),
+                    channel,
+                    dopActive ? '24-bit' : _compactDepthLabel(status),
+                  ]),
+                ],
+              ),
+            );
+          },
         );
       },
     );
@@ -857,15 +870,19 @@ class _AudioOutputSettingsLayerState extends State<AudioOutputSettingsLayer> {
           children: [
             for (var index = 0; index < values.length; index++) ...[
               Expanded(
-                child: Text(
-                  values[index],
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    color: textColor.value.withAlpha(220),
-                    fontSize: 22,
-                    height: 1.05,
-                    fontWeight: FontWeight.w500,
+                // DSD128 / 352.8 kHz 之类的长值超出列宽时整体缩小，不省略截断
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    values[index],
+                    maxLines: 1,
+                    style: TextStyle(
+                      color: textColor.value.withAlpha(220),
+                      fontSize: 22,
+                      height: 1.05,
+                      fontWeight: FontWeight.w500,
+                    ),
                   ),
                 ),
               ),
