@@ -817,6 +817,7 @@ class MyAudioHandler extends BaseAudioHandler with WidgetsBindingObserver {
         ),
         startPaused: !isPlayingNotifier.value,
         streaming: streaming,
+        totalBytes: streaming ? _estimateStreamTotalBytes(song) : null,
       ),
     );
 
@@ -866,6 +867,19 @@ class MyAudioHandler extends BaseAudioHandler with WidgetsBindingObserver {
     if (path.endsWith('.dsf')) return 'dsf';
     if (path.endsWith('.dff')) return 'dff';
     return null;
+  }
+
+  /// 流式独占的完整文件字节数估算：时长 × 码率，再放大保证 ≥ 真实大小，
+  /// 让引擎侧 MediaExtractor 能对增长中的 .part 正确 seek（真实边界由 readAt
+  /// 按当前 .part 长度兜底等待）。时长未知时返回 null（引擎回退旧行为）。
+  int? _estimateStreamTotalBytes(MyAudioMetadata song) {
+    final durationSec = song.duration?.inSeconds ?? 0;
+    if (durationSec <= 0) {
+      return null;
+    }
+    final bytesPerSecond =
+        ((song.bitrate ?? 0) > 0 ? song.bitrate! : 2000) * 1000 ~/ 8;
+    return (durationSec * bytesPerSecond * 1.2).toInt();
   }
 
   Future<String?> _exclusivePlayablePath(

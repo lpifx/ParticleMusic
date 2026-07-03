@@ -191,6 +191,9 @@ class UsbExclusiveAudioEngine(
         // 流式独占：file 是仍在下载增长的 .part 文件，下载完成时会被改名为正式
         // 缓存名（已打开的 fd 不受影响）。数据没跟上时按"暂停"处理，绝不断流爆音。
         val streaming = arguments["streaming"] == true
+        // 流式独占的完整文件大小估算：让 GrowingFileDataSource.getSize() 返回它，
+        // MediaExtractor 才能对增长中的 .part 正确 seek（0 表示未知，退回旧的 -1）
+        val streamTotalBytes = (arguments["totalBytes"] as? Number)?.toLong() ?: 0L
 
         // 该设备的 quirk 生效值（vid:pid 精确 → vid:* 厂商 → 默认）
         val quirk = UsbDacQuirks.forDevice(context, device.vendorId, device.productId)
@@ -501,7 +504,7 @@ class UsbExclusiveAudioEngine(
             if (reader != null) {
                 dsdDecodeAndWrite(reader, target, if (streaming) file else null, workerNativeFormat)
             } else {
-                decodeAndWrite(file, target, streaming)
+                decodeAndWrite(file, target, streaming, streamTotalBytes)
             }
         }, "SylvakruUsbExclusive")
         worker?.start()
@@ -727,7 +730,12 @@ class UsbExclusiveAudioEngine(
         )
     }
 
-    private fun decodeAndWrite(file: File, target: OutputTarget, streaming: Boolean = false) {
+    private fun decodeAndWrite(
+        file: File,
+        target: OutputTarget,
+        streaming: Boolean = false,
+        totalBytes: Long = 0L,
+    ) {
         val extractor = MediaExtractor()
         var codec: MediaCodec? = null
         var dataSource: GrowingFileDataSource? = null
@@ -743,7 +751,7 @@ class UsbExclusiveAudioEngine(
 
         try {
             if (streaming) {
-                dataSource = GrowingFileDataSource(file, RandomAccessFile(file, "r"))
+                dataSource = GrowingFileDataSource(file, RandomAccessFile(file, "r"), totalBytes)
                 extractor.setDataSource(dataSource)
             } else {
                 extractor.setDataSource(file.absolutePath)
@@ -1005,6 +1013,7 @@ class UsbExclusiveAudioEngine(
     private inner class GrowingFileDataSource(
         private val partFile: File,
         private val input: RandomAccessFile,
+        private val totalBytes: Long = 0L,
     ) : MediaDataSource() {
         private val rebufferBytes = 256L * 1024L
         private var bufferingLogged = false
@@ -1038,8 +1047,14 @@ class UsbExclusiveAudioEngine(
         }
 
         override fun getSize(): Long {
-            // 下载没结束时总大小未知；MediaExtractor 对顺序解码可以接受 -1
-            return if (partFile.exists()) -1L else input.length()
+            // 下载完成后返回真实大小。下载中返回估算总大小（偏大保证 ≥ 真实），
+            // 让 MediaExtractor 认定文件有界、可按 FLAC seektable 定位到任意时间点
+            // 去 seek 未下载区（readAt 再按当前 .part 长度兜底等待下载）。估算缺失
+            // （0）时退回 -1（旧行为：只能顺序解码，seek 未下载区会误判 EOF）。
+            if (!partFile.exists()) {
+                return input.length()
+            }
+            return if (totalBytes > 0L) maxOf(totalBytes, input.length()) else -1L
         }
 
         override fun close() {
@@ -1363,7 +1378,11 @@ class UsbExclusiveAudioEngine(
             extractor.advance()
         }
 
-        UsbDiagnostics.i(tag, "exclusive raw PCM reached end of stream, flushing remainder.")
+        UsbDiagnostics.i(
+            tag,
+            "exclusive raw PCM loop exit: stopped=${stopped.get()}, streaming=$streaming, " +
+                "partExists=${file.exists()}, lastPos=${streamTargetMs}ms",
+        )
         packetizer.flush()
         if (!stopped.get()) {
             workerEndedAtEof = true

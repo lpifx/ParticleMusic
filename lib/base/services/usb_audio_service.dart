@@ -377,6 +377,10 @@ class UsbExclusivePlaybackRequest {
   /// filePath 是仍在下载增长中的 .part 缓存文件（流式独占）
   final bool streaming;
 
+  /// 流式独占用的完整文件字节数估算（时长×码率，偏大）；引擎据此让
+  /// MediaExtractor 能对增长中的 .part 正确 seek，0/null 表示未知（回退旧行为）
+  final int? totalBytes;
+
   const UsbExclusivePlaybackRequest({
     required this.filePath,
     required this.title,
@@ -387,6 +391,7 @@ class UsbExclusivePlaybackRequest {
     required this.targetBufferMs,
     required this.startPaused,
     this.streaming = false,
+    this.totalBytes,
   });
 
   Map<String, Object?> toMap() {
@@ -400,6 +405,7 @@ class UsbExclusivePlaybackRequest {
       'targetBufferMs': targetBufferMs,
       'startPaused': startPaused,
       'streaming': streaming,
+      'totalBytes': totalBytes,
     };
   }
 }
