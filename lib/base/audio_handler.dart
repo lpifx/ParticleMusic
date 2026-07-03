@@ -709,6 +709,34 @@ class MyAudioHandler extends BaseAudioHandler with WidgetsBindingObserver {
       unawaited(_superLyric.sendStop());
     }
     updatePlaybackState(postion: Duration.zero);
+    _prefetchNextSongCache();
+  }
+
+  /// 独占模式连播优化：当前曲开播后预下载队列下一首云端歌曲，
+  /// 自动切歌时下一首已整首缓存，可直接走独占。先等当前曲的缓存
+  /// 下载完（tryAddCache 按路径去重，重复调用会合并），避免抢带宽。
+  void _prefetchNextSongCache() {
+    if (!Platform.isAndroid ||
+        !usbAudioPreferences.performanceModeNotifier.value) {
+      return;
+    }
+    if (playQueue.length < 2) {
+      return;
+    }
+    final current = playQueue[currentIndex];
+    final next = playQueue[(currentIndex + 1) % playQueue.length];
+    if (next.sourceType == .local || next.cacheExist) {
+      return;
+    }
+    unawaited(() async {
+      try {
+        await library.tryAddCache(current);
+        await library.tryAddCache(next);
+        logger.output("prefetched next song cache:${next.title}");
+      } catch (error) {
+        logger.output("prefetch next cache failed:$error");
+      }
+    }());
   }
 
   Future<bool> _tryOpenUsbExclusive(
