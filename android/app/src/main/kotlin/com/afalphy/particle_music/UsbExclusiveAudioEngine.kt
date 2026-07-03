@@ -436,15 +436,15 @@ class UsbExclusiveAudioEngine(
             }
             UsbDiagnostics.i(tag, "native USB exclusive endpoint opened.")
 
-            // 时钟：native DSD 按字节率 SET_CUR（DSD 速率 ÷ 8，与 Linux snd-usb 一致），
-            // DoP/PCM 按帧率
-            val clockRate = if (nativeDsd) dsdReader!!.sampleRate / 8 else requestedSampleRate
-            if (clockRate != null) {
+            // 时钟：native DSD 与 DoP/PCM 一样按容器帧率 SET_CUR（与 ALSA runtime rate
+            // 语义一致，DSD128 u32le → 176400）。真机教训：设成字节率（速率÷8）会被
+            // Macaron 无视，DAC 停在别的时钟上按错误节奏消耗数据，输出持续电流声
+            if (requestedSampleRate != null) {
                 val clockError = configureUsbAudioClock(
                     openedConnection,
                     device,
                     resolvedTarget,
-                    clockRate,
+                    requestedSampleRate,
                     quirk,
                 )
                 if (clockError != null) {
