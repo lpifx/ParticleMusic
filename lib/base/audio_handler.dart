@@ -104,6 +104,8 @@ class MyAudioHandler extends BaseAudioHandler with WidgetsBindingObserver {
 
   bool isLoading = false;
   bool isSyncing = false;
+  // load 的代次号：云端下载/权限弹窗等慢路径期间用户再切歌时，旧的 load 凭它自行作废
+  int _loadGeneration = 0;
 
   MyAudioHandler() {
     // avoid reading .lrc files
@@ -592,6 +594,7 @@ class MyAudioHandler extends BaseAudioHandler with WidgetsBindingObserver {
   }
 
   Future<void> load() async {
+    final generation = ++_loadGeneration;
     if (currentSongNotifier.value != null) {
       if (_playLastSyncTime != null) {
         _playedDuration += DateTime.now().difference(_playLastSyncTime!);
@@ -615,6 +618,9 @@ class MyAudioHandler extends BaseAudioHandler with WidgetsBindingObserver {
     final currentSong = playQueue[currentIndex];
 
     await _setLyricsAndUpdateColors(currentSong);
+    if (generation != _loadGeneration) {
+      return;
+    }
     _superLyric.updateLines(currentSong.parsedLyrics!.lines);
 
     currentSongNotifier.value = currentSong;
@@ -625,7 +631,14 @@ class MyAudioHandler extends BaseAudioHandler with WidgetsBindingObserver {
       _usbExclusiveActive = false;
       _usbExclusivePosition = Duration.zero;
 
-      final openedExclusive = await _tryOpenUsbExclusive(currentSong);
+      final openedExclusive = await _tryOpenUsbExclusive(
+        currentSong,
+        generation: generation,
+      );
+      if (generation != _loadGeneration) {
+        isLoading = false;
+        return;
+      }
       if (openedExclusive) {
         await _stopPlayerForUsbExclusive();
         if (isPlayingNotifier.value) {
@@ -633,6 +646,10 @@ class MyAudioHandler extends BaseAudioHandler with WidgetsBindingObserver {
         }
       } else {
         await _applyUsbOutputForSong(currentSong);
+        if (generation != _loadGeneration) {
+          isLoading = false;
+          return;
+        }
         if (currentSong.cacheExist) {
           await _player.open(
             Media(currentSong.cachePath!),
@@ -694,7 +711,10 @@ class MyAudioHandler extends BaseAudioHandler with WidgetsBindingObserver {
     updatePlaybackState(postion: Duration.zero);
   }
 
-  Future<bool> _tryOpenUsbExclusive(MyAudioMetadata song) async {
+  Future<bool> _tryOpenUsbExclusive(
+    MyAudioMetadata song, {
+    int? generation,
+  }) async {
     if (!_shouldTryUsbExclusive(song)) {
       return false;
     }
@@ -746,6 +766,11 @@ class MyAudioHandler extends BaseAudioHandler with WidgetsBindingObserver {
       debugPrint(
         "usb exclusive fallback:unsupported source samplerate=${song.samplerate}",
       );
+      return false;
+    }
+
+    if (generation != null && generation != _loadGeneration) {
+      // 权限弹窗/路径解析期间用户已切到别的歌，放弃启动独占
       return false;
     }
 
@@ -821,16 +846,15 @@ class MyAudioHandler extends BaseAudioHandler with WidgetsBindingObserver {
       return song.cachePath;
     }
 
-    try {
-      await library.tryAddCache(song);
-    } catch (error) {
-      logger.output("usb exclusive cache failed:$error");
-      return null;
-    }
-
-    if (song.cacheExist && song.cachePath != null) {
-      return song.cachePath;
-    }
+    // 云端歌曲未缓存时不阻塞等整首下载：本次先走共享流式立即出声，
+    // 后台缓存完成后，之后再播这首即可走独占
+    unawaited(
+      library.tryAddCache(song).catchError((Object error) {
+        logger.output("usb exclusive cache failed:$error");
+      }),
+    );
+    logger.output("usb exclusive skipped:cloud song not cached -> streaming");
+    debugPrint("usb exclusive skipped:cloud song not cached -> streaming");
     return null;
   }
 
