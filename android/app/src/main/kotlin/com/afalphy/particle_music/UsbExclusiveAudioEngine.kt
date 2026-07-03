@@ -304,14 +304,9 @@ class UsbExclusiveAudioEngine(
             target = sessionTarget!!
             mainHandler.removeCallbacks(deferredCloseRunnable)
             stopDopIdleFiller()
-            if (!workerEndedAtEof && sessionDsd == null) {
-                // PCM 手动切歌丢在途 URB 保响应；DoP 一律不 flush——丢 URB 会
-                // 瞬断 ISO 流让 DAC 掉出 DSD 模式再重锁（咔嗒声），旧缓冲
-                // （约一个水位）放完无缝续上新曲，标记相位全程连续
-                UsbExclusiveNative.flushOutput()?.let { flushError ->
-                    UsbDiagnostics.w(tag, "flush on session reuse failed: $flushError")
-                }
-            }
+            // 热复用切歌一律不 flush：丢在途 URB 会瞬断 ISO 流——DSD 会让 DAC 掉出
+            // DSD 模式重锁（咔嗒），PCM 会瞬间欠载出小音爆。旧缓冲（约一个水位）
+            // 放完无缝续上新曲，与自然播完切歌（workerEndedAtEof）行为一致。
             UsbDiagnostics.i(
                 tag,
                 "reusing exclusive USB session sampleRate=$requestedSampleRate, " +
@@ -559,15 +554,11 @@ class UsbExclusiveAudioEngine(
     fun stop(): Map<String, Any?> {
         val keepSession = stopWorkerKeepingSession()
         if (keepSession && connection != null) {
-            if (!workerEndedAtEof && sessionDsd == null) {
-                // PCM 手动停止/切歌丢在途 URB 让停止即时生效；DoP/native DSD 一律不
-                // flush（会瞬断 ISO 流让 DAC 掉锁），旧缓冲放完由静音接续
-                UsbExclusiveNative.flushOutput()?.let { flushError ->
-                    UsbDiagnostics.w(tag, "flush on stop failed: $flushError")
-                }
-            }
-            // 空窗期持续垫 DoP 静音直到下一首接管或延迟关闭（自然播完时
-            // 写线程退出前已启动，重复调用无副作用）
+            // 停止/切歌一律不 flush：丢在途 URB 会瞬断 ISO 流（DSD 掉锁、PCM 小音爆）。
+            // 旧缓冲（约一个水位）放完，DSD 交给静音填充线程接续、PCM 自然收尾，
+            // 由延迟关闭兜底。切歌场景旧尾放完后由下一首 start 无缝续上。
+            // 空窗期持续垫 DoP/native 静音直到下一首接管或延迟关闭（自然播完时
+            // 写线程退出前已启动，重复调用无副作用；PCM 无编码器时为空操作）
             startDopIdleFiller()
             scheduleDeferredClose()
         }
@@ -830,10 +821,8 @@ class UsbExclusiveAudioEngine(
                 consumePendingSeekMs()?.let { seekMs ->
                     val seekUs = seekMs * 1000
                     UsbDiagnostics.i(tag, "exclusive decoder seek to ${seekMs}ms.")
-                    // 丢弃在途 URB，seek 立即生效而不是等旧缓冲放完
-                    UsbExclusiveNative.flushOutput()?.let { flushError ->
-                        UsbDiagnostics.w(tag, "flush before seek failed: $flushError")
-                    }
+                    // seek 不 flush：丢在途 URB 会瞬断 ISO 流出小音爆（与 DoP 同因）。
+                    // 只在解码侧跳位，旧缓冲（约一个水位）放完后无缝续上新位置。
                     extractor.seekTo(seekUs, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
                     codec.flush()
                     packetizer?.reset()
@@ -1266,10 +1255,8 @@ class UsbExclusiveAudioEngine(
             consumePendingSeekMs()?.let { seekMs ->
                 val seekUs = seekMs * 1000
                 UsbDiagnostics.i(tag, "exclusive raw PCM seek to ${seekMs}ms.")
-                // 丢弃在途 URB，seek 立即生效而不是等旧缓冲放完
-                UsbExclusiveNative.flushOutput()?.let { flushError ->
-                    UsbDiagnostics.w(tag, "flush before seek failed: $flushError")
-                }
+                // seek 不 flush：丢在途 URB 会瞬断 ISO 流出小音爆（与 DoP 同因）。
+                // 只在解码侧跳位，旧缓冲（约一个水位）放完后无缝续上新位置。
                 extractor.seekTo(seekUs, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
                 packetizer.reset()
                 lastPositionEmitMs = -1L
