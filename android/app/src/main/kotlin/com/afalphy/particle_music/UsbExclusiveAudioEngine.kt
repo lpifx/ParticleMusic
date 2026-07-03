@@ -12,6 +12,8 @@ import android.media.MediaDataSource
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -81,6 +83,22 @@ class UsbExclusiveAudioEngine(
     private var zeroBufferUnderruns = 0L
     private var activePacketsPerSecond = 0
 
+    // 热切换：切歌时设备与端点参数（时钟/声道/位深）不变就保留已打开的 USB
+    // 会话，不重新 claim 接口/设 altsetting/配时钟，DAC 不会重新锁定（重新锁定
+    // 就是切歌"咔嗒/电流"声的来源）。会话在停播后延迟关闭，短时间内没有新的
+    // start 才真正拆链路。
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val deferredCloseRunnable = Runnable { hardCloseSession("idle timeout") }
+    private var sessionDeviceId: Int? = null
+    private var sessionSampleRate: Int? = null
+    private var sessionChannels: Int? = null
+    private var sessionBitDepth: Int? = null
+    private var sessionTarget: OutputTarget? = null
+    @Volatile private var sessionBroken = false
+
+    // DoP 会话在切歌空窗期垫 0x69 静音用（写线程退出后由主线程调用，无并发）
+    @Volatile private var dopIdleFill: (() -> Unit)? = null
+
     fun capabilities(usbManager: UsbManager, device: UsbDevice?): Map<String, Any?> {
         if (!NATIVE_USB_EXCLUSIVE_STREAMING_ENABLED) {
             return capability(
@@ -121,7 +139,12 @@ class UsbExclusiveAudioEngine(
         device: UsbDevice?,
         arguments: Map<String, Any?>,
     ): Map<String, Any?> {
-        stop()
+        // 停掉上一首的写线程但先不拆 USB 会话，后面参数匹配时热复用
+        val sessionUsable = stopWorkerKeepingSession()
+        if (connection != null) {
+            // 下面任一校验失败提前返回时，兜底延迟关闭残留会话
+            scheduleDeferredClose()
+        }
 
         if (!NATIVE_USB_EXCLUSIVE_STREAMING_ENABLED) {
             return updateState(inactiveState(NATIVE_USB_EXCLUSIVE_DISABLED_MESSAGE))
@@ -224,80 +247,114 @@ class UsbExclusiveAudioEngine(
         zeroBufferUnderruns = 0L
         activePacketsPerSecond = 0
         val requestedChannels = dsdReader?.channels ?: 2
-        val openedConnection = usbManager.openDevice(device)
-            ?: run {
-                dsdReader?.close()
-                return updateState(inactiveState("Failed to open USB device for exclusive playback."))
+        // 设备与端点参数都没变时热复用已打开的会话；DoP 复用还要确认既有
+        // slot ≥ 24-bit（16-bit slot 无法承载 DoP 的 8 位标记 + 16 位数据）
+        val reuseSession = sessionUsable &&
+            connection != null &&
+            sessionTarget != null &&
+            sessionDeviceId == device.deviceId &&
+            sessionSampleRate == requestedSampleRate &&
+            sessionChannels == requestedChannels &&
+            sessionBitDepth == requestedBitDepth &&
+            (dsdReader == null || sessionTarget!!.usbBytesPerSample >= 3)
+        val target: OutputTarget
+        if (reuseSession) {
+            target = sessionTarget!!
+            mainHandler.removeCallbacks(deferredCloseRunnable)
+            // 只丢上一首的在途 URB，接口/altsetting/时钟原样保留
+            UsbExclusiveNative.flushOutput()?.let { flushError ->
+                UsbDiagnostics.w(tag, "flush on session reuse failed: $flushError")
             }
-        val descriptors = openedConnection.rawDescriptors
-        val streamingFormats = parseStreamingFormatInfo(descriptors)
-        val target = findOutputTarget(
-            device,
-            streamingFormats = streamingFormats,
-            sampleRate = requestedSampleRate,
-            channels = requestedChannels,
-            bitDepth = requestedBitDepth,
-        )
-            ?: run {
-                openedConnection.close()
-                dsdReader?.close()
-                return updateState(inactiveState("No isochronous USB Audio OUT endpoint was found."))
-            }
-        if (dsdReader != null && target.usbBytesPerSample < 3) {
-            // 16-bit slot 无法承载 DoP 的 8 位标记 + 16 位数据
-            openedConnection.close()
-            dsdReader.close()
-            return updateState(
-                inactiveState(
-                    "DoP requires a 24/32-bit output slot, but the device only exposes " +
-                        "${target.usbBitResolution ?: target.usbBytesPerSample * 8}-bit at " +
-                        "${requestedSampleRate}Hz.",
-                ),
+            UsbDiagnostics.i(
+                tag,
+                "reusing exclusive USB session sampleRate=$requestedSampleRate, " +
+                    "channels=$requestedChannels, bitDepth=${requestedBitDepth ?: "auto"}",
             )
-        }
-        UsbDiagnostics.i(
-            tag,
-            "exclusive target interface=${target.usbInterface.id}, alt=${target.alternateSetting}, " +
-                "endpoint=0x${target.endpoint.address.toString(16)}, maxPacket=${target.endpoint.maxPacketSize}, " +
-                "feedback=${target.feedbackEndpointLabel}, " +
-                "requestedSampleRate=$requestedSampleRate, requestedBitDepth=${requestedBitDepth ?: "auto"}, " +
-                "usbFormat=${target.formatInfo}",
-        )
-
-        val openError = UsbExclusiveNative.open(
-            openedConnection.fileDescriptor,
-            target.usbInterface.id,
-            target.alternateSetting,
-            target.endpoint.address,
-            target.endpoint.maxPacketSize,
-            target.feedbackEndpoint?.address ?: 0,
-            target.feedbackEndpoint?.maxPacketSize ?: 0,
-            false,
-        )
-        if (openError != null) {
-            openedConnection.close()
-            dsdReader?.close()
-            return updateState(inactiveState(openError))
-        }
-        UsbDiagnostics.i(tag, "native USB exclusive endpoint opened.")
-
-        if (requestedSampleRate != null) {
-            val clockError = configureUsbAudioClock(
-                openedConnection,
+        } else {
+            hardCloseSession("device or stream parameters changed")
+            val openedConnection = usbManager.openDevice(device)
+                ?: run {
+                    dsdReader?.close()
+                    return updateState(inactiveState("Failed to open USB device for exclusive playback."))
+                }
+            val descriptors = openedConnection.rawDescriptors
+            val streamingFormats = parseStreamingFormatInfo(descriptors)
+            val resolvedTarget = findOutputTarget(
                 device,
-                target,
-                requestedSampleRate,
-                quirk,
+                streamingFormats = streamingFormats,
+                sampleRate = requestedSampleRate,
+                channels = requestedChannels,
+                bitDepth = requestedBitDepth,
             )
-            if (clockError != null) {
-                UsbExclusiveNative.close()
+                ?: run {
+                    openedConnection.close()
+                    dsdReader?.close()
+                    return updateState(inactiveState("No isochronous USB Audio OUT endpoint was found."))
+                }
+            if (dsdReader != null && resolvedTarget.usbBytesPerSample < 3) {
+                // 16-bit slot 无法承载 DoP 的 8 位标记 + 16 位数据
+                openedConnection.close()
+                dsdReader.close()
+                return updateState(
+                    inactiveState(
+                        "DoP requires a 24/32-bit output slot, but the device only exposes " +
+                            "${resolvedTarget.usbBitResolution ?: resolvedTarget.usbBytesPerSample * 8}-bit at " +
+                            "${requestedSampleRate}Hz.",
+                    ),
+                )
+            }
+            UsbDiagnostics.i(
+                tag,
+                "exclusive target interface=${resolvedTarget.usbInterface.id}, alt=${resolvedTarget.alternateSetting}, " +
+                    "endpoint=0x${resolvedTarget.endpoint.address.toString(16)}, maxPacket=${resolvedTarget.endpoint.maxPacketSize}, " +
+                    "feedback=${resolvedTarget.feedbackEndpointLabel}, " +
+                    "requestedSampleRate=$requestedSampleRate, requestedBitDepth=${requestedBitDepth ?: "auto"}, " +
+                    "usbFormat=${resolvedTarget.formatInfo}",
+            )
+
+            val openError = UsbExclusiveNative.open(
+                openedConnection.fileDescriptor,
+                resolvedTarget.usbInterface.id,
+                resolvedTarget.alternateSetting,
+                resolvedTarget.endpoint.address,
+                resolvedTarget.endpoint.maxPacketSize,
+                resolvedTarget.feedbackEndpoint?.address ?: 0,
+                resolvedTarget.feedbackEndpoint?.maxPacketSize ?: 0,
+                false,
+            )
+            if (openError != null) {
                 openedConnection.close()
                 dsdReader?.close()
-                return updateState(inactiveState(clockError))
+                return updateState(inactiveState(openError))
             }
-        }
+            UsbDiagnostics.i(tag, "native USB exclusive endpoint opened.")
 
-        connection = openedConnection
+            if (requestedSampleRate != null) {
+                val clockError = configureUsbAudioClock(
+                    openedConnection,
+                    device,
+                    resolvedTarget,
+                    requestedSampleRate,
+                    quirk,
+                )
+                if (clockError != null) {
+                    UsbExclusiveNative.close()
+                    openedConnection.close()
+                    dsdReader?.close()
+                    return updateState(inactiveState(clockError))
+                }
+            }
+
+            connection = openedConnection
+            sessionDeviceId = device.deviceId
+            sessionSampleRate = requestedSampleRate
+            sessionChannels = requestedChannels
+            sessionBitDepth = requestedBitDepth
+            sessionTarget = resolvedTarget
+            target = resolvedTarget
+        }
+        sessionBroken = false
+        dopIdleFill = null
         paused.set(arguments["startPaused"] == true)
         stopped.set(false)
         pendingSeekMs.set(-1L)
@@ -376,22 +433,73 @@ class UsbExclusiveAudioEngine(
     }
 
     fun stop(): Map<String, Any?> {
+        val keepSession = stopWorkerKeepingSession()
+        if (keepSession && connection != null) {
+            // 立即丢在途 URB 让停止即时生效；DoP 会话垫一小段 0x69 静音，
+            // 空窗期 DAC 停留在 DSD 模式等下一首；会话延迟关闭
+            UsbExclusiveNative.flushOutput()?.let { flushError ->
+                UsbDiagnostics.w(tag, "flush on stop failed: $flushError")
+            }
+            dopIdleFill?.let { fill ->
+                runCatching { fill() }.onFailure { error ->
+                    UsbDiagnostics.w(tag, "DoP idle fill failed: ${error.message}")
+                    hardCloseSession("DoP idle fill failed")
+                }
+            }
+            scheduleDeferredClose()
+        }
+        return updateState(inactiveState("USB exclusive playback stopped."))
+    }
+
+    fun release(): Map<String, Any?> {
+        stopWorkerKeepingSession()
+        hardCloseSession("release")
+        return updateState(inactiveState("USB exclusive playback stopped."))
+    }
+
+    // 停写线程；返回 true 表示线程干净退出、USB 会话仍可热复用
+    private fun stopWorkerKeepingSession(): Boolean {
         stopped.set(true)
         paused.set(false)
         pendingSeekMs.set(-1L)
         val thread = worker
         worker = null
-        if (thread != null && thread != Thread.currentThread()) {
-            thread.join(500)
+        if (thread == null || thread == Thread.currentThread()) {
+            return !sessionBroken && connection != null
         }
+        thread.join(800)
+        if (thread.isAlive) {
+            // 收不回来（多半阻塞在 native 写的水位回收上），只能硬关让写立即返回
+            UsbDiagnostics.w(tag, "exclusive worker join timeout, forcing session close")
+            hardCloseSession("worker join timeout")
+            thread.join(500)
+            return false
+        }
+        return !sessionBroken && connection != null
+    }
+
+    private fun scheduleDeferredClose() {
+        mainHandler.removeCallbacks(deferredCloseRunnable)
+        mainHandler.postDelayed(deferredCloseRunnable, 4000L)
+    }
+
+    private fun hardCloseSession(reason: String) {
+        if (connection == null && sessionTarget == null) {
+            return
+        }
+        UsbDiagnostics.i(tag, "close exclusive USB session: $reason")
+        mainHandler.removeCallbacks(deferredCloseRunnable)
+        dopIdleFill = null
+        sessionTarget = null
+        sessionDeviceId = null
+        sessionSampleRate = null
+        sessionChannels = null
+        sessionBitDepth = null
         UsbExclusiveNative.close()
         connection?.close()
         connection = null
         activePacketsPerSecond = 0
-        return updateState(inactiveState("USB exclusive playback stopped."))
     }
-
-    fun release(): Map<String, Any?> = stop()
 
     private fun emitTransportTelemetry(packetsPerSecond: Int, force: Boolean = false) {
         val nowMs = SystemClock.elapsedRealtime()
@@ -694,6 +802,7 @@ class UsbExclusiveAudioEngine(
             }
         } catch (error: Throwable) {
             UsbDiagnostics.w("UsbExclusiveAudioEngine", "Exclusive playback failed.", error)
+            sessionBroken = true
             emitError(error.message ?: "USB exclusive playback failed.")
         } finally {
             try {
@@ -703,9 +812,12 @@ class UsbExclusiveAudioEngine(
             codec?.release()
             extractor.release()
             runCatching { dataSource?.close() }
-            UsbExclusiveNative.close()
-            connection?.close()
-            connection = null
+            if (sessionBroken) {
+                hardCloseSession("decode worker failed")
+            } else {
+                // 会话留给下一首热复用，短时间内没有新的 start 再关
+                scheduleDeferredClose()
+            }
         }
     }
 
@@ -791,6 +903,12 @@ class UsbExclusiveAudioEngine(
             val silenceFramesPerWrite = maxOf(1, reader.dopFrameRate / 100)
             val buffer = ByteArray(reader.channels * 2 * silenceFramesPerWrite)
 
+            // 切歌空窗期由主线程垫约 200ms DoP 静音，DAC 不掉出 DSD 模式
+            dopIdleFill = {
+                packetizer.write(dop.encodeSilence(silenceFramesPerWrite * 20))
+                packetizer.flush()
+            }
+
             while (!stopped.get()) {
                 consumePendingSeekMs()?.let { seekMs ->
                     // 先丢弃在途 URB 让 seek 立即生效，再同步复位 DoP 标记相位与打包器
@@ -842,9 +960,10 @@ class UsbExclusiveAudioEngine(
 
                 val count = reader.read(buffer)
                 if (count < 0) {
-                    // 结尾不足一帧的余量补 0x69，再垫一小段静音把尾部数据完整送出
+                    // 结尾不足一帧的余量补 0x69，再垫约 200ms 静音把尾部完整送出，
+                    // 同时盖住自动切歌的空窗，DAC 不掉出 DSD 模式
                     packetizer.write(dop.drain())
-                    packetizer.write(dop.encodeSilence(silenceFramesPerWrite))
+                    packetizer.write(dop.encodeSilence(silenceFramesPerWrite * 20))
                     packetizer.flush()
                     break
                 }
@@ -869,12 +988,16 @@ class UsbExclusiveAudioEngine(
             }
         } catch (error: Throwable) {
             UsbDiagnostics.w(tag, "Exclusive DoP playback failed.", error)
+            sessionBroken = true
             emitError(error.message ?: "USB exclusive DoP playback failed.")
         } finally {
             runCatching { reader.close() }
-            UsbExclusiveNative.close()
-            connection?.close()
-            connection = null
+            if (sessionBroken) {
+                hardCloseSession("DoP worker failed")
+            } else {
+                // 会话留给下一首热复用，短时间内没有新的 start 再关
+                scheduleDeferredClose()
+            }
         }
     }
 
