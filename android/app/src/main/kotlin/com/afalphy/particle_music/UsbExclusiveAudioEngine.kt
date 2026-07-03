@@ -154,6 +154,9 @@ class UsbExclusiveAudioEngine(
             return updateState(inactiveState("Exclusive playback currently supports FLAC, WAV and DSD (.dsf/.dff) only."))
         }
 
+        // 该设备的 quirk 生效值（vid:pid 精确 → vid:* 厂商 → 默认）
+        val quirk = UsbDacQuirks.forDevice(context, device.vendorId, device.productId)
+
         // DSD 文件目前独占链路只支持 DoP 输出；pcm 模式在 Dart 侧直接走共享路径，不会到这里
         val dsdMode = (arguments["dsdMode"] as? String)?.lowercase(Locale.ROOT)
         var dsdReader: DsdFileReader? = null
@@ -165,16 +168,34 @@ class UsbExclusiveAudioEngine(
                     ),
                 )
             }
+            // DoP 对 DAC 是透明 PCM，描述符无法声明支持与否，先看 quirk 的明确判定
+            if (quirk.dopSupported == false) {
+                return updateState(
+                    inactiveState(
+                        "Device is marked as not supporting DoP (quirk" +
+                            "${quirk.label?.let { ": $it" } ?: ""}).",
+                    ),
+                )
+            }
             dsdReader = try {
                 DsdFileReader.open(file)
             } catch (error: IOException) {
                 return updateState(inactiveState(error.message ?: "Failed to parse DSD file."))
             }
+            val multiple = dsdReader.dsdMultiple
+            if (quirk.dopMaxDsd != null && multiple != null && multiple > quirk.dopMaxDsd) {
+                dsdReader.close()
+                return updateState(
+                    inactiveState(
+                        "DSD$multiple exceeds this device's DoP limit (DSD${quirk.dopMaxDsd}, quirk).",
+                    ),
+                )
+            }
             UsbDiagnostics.i(
                 tag,
                 "DSD source rate=${dsdReader.sampleRate} (DSD${dsdReader.dsdMultiple ?: "?"}), " +
                     "channels=${dsdReader.channels}, container=${dsdReader.formatName}, " +
-                    "dopFrameRate=${dsdReader.dopFrameRate}",
+                    "dopFrameRate=${dsdReader.dopFrameRate}, quirk dop=${quirk.dopSupported}",
             )
         }
 
@@ -251,7 +272,13 @@ class UsbExclusiveAudioEngine(
         UsbDiagnostics.i(tag, "native USB exclusive endpoint opened.")
 
         if (requestedSampleRate != null) {
-            val clockError = configureUsbAudioClock(openedConnection, device, target, requestedSampleRate)
+            val clockError = configureUsbAudioClock(
+                openedConnection,
+                device,
+                target,
+                requestedSampleRate,
+                quirk,
+            )
             if (clockError != null) {
                 UsbExclusiveNative.close()
                 openedConnection.close()
@@ -971,6 +998,7 @@ class UsbExclusiveAudioEngine(
         device: UsbDevice,
         target: OutputTarget,
         sampleRate: Int,
+        quirk: DacQuirk = DacQuirk(),
     ): String? {
         val controlInterface = findAudioControlInterface(device)
         val controlInterfaceNumber = controlInterface?.id ?: target.usbInterface.id
@@ -1011,6 +1039,14 @@ class UsbExclusiveAudioEngine(
                     "UAC2 clock SET_CUR sampleRate=$sampleRate, clockSourceId=$clockSourceId, " +
                     "controlInterface=$controlInterfaceNumber, result=$result",
                 )
+                // quirk：部分 DAC SET_CUR 后需要几十 ms 才锁定新时钟
+                if (quirk.clockSetCurDelayMs > 0) {
+                    Thread.sleep(quirk.clockSetCurDelayMs.toLong())
+                }
+                if (quirk.clockSkipGetCurValidation) {
+                    // quirk：个别设备 GET_CUR 返回垃圾但 SET_CUR 实际生效
+                    return null
+                }
                 val readBack = readUac2ClockSampleRate(
                     connection,
                     clockSourceId,
@@ -1048,6 +1084,9 @@ class UsbExclusiveAudioEngine(
                     target.endpoint.address.toString(16)
                 }, result=$result",
             )
+            if (quirk.clockSetCurDelayMs > 0) {
+                Thread.sleep(quirk.clockSetCurDelayMs.toLong())
+            }
             return null
         } catch (error: RuntimeException) {
             UsbDiagnostics.w(tag, "USB audio clock configuration failed.", error)
@@ -1214,6 +1253,20 @@ class UsbExclusiveAudioEngine(
                         "format=${candidate.formatInfo}"
                 },
                 "clockSourceId" to clockSourceId,
+                // quirk 匹配结果：命中哪条 / 未命中用默认值，以及各字段生效值
+                "quirkMatch" to (UsbDacQuirks.matchDescription(
+                    context,
+                    device.vendorId,
+                    device.productId,
+                ) ?: "none (defaults)"),
+                "quirkEffective" to UsbDacQuirks.forDevice(
+                    context,
+                    device.vendorId,
+                    device.productId,
+                ).toString(),
+                "quirkLoadErrors" to UsbDacQuirks.loadErrors(context)
+                    .joinToString("; ")
+                    .takeIf { it.isNotEmpty() },
             )
         } catch (error: RuntimeException) {
             mapOf(

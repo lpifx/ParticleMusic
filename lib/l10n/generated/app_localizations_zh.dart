@@ -785,6 +785,21 @@ class AppLocalizationsZh extends AppLocalizations {
       '汇总设备描述符、解析结果与最近日志，一键复制或导出发给开发者排查 DAC 兼容问题。';
 
   @override
+  String get importQuirkConfig => '导入 quirk 配置';
+
+  @override
+  String get importQuirkConfigDesc => '粘贴开发者提供的设备适配 JSON，导入后重新连接设备生效';
+
+  @override
+  String get importAction => '导入';
+
+  @override
+  String get importQuirkSuccess => 'quirk 配置已导入，重新连接设备后生效';
+
+  @override
+  String get importQuirkFailed => '导入失败';
+
+  @override
   String get generating => '生成中';
 
   @override

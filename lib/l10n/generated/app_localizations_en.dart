@@ -803,6 +803,23 @@ class AppLocalizationsEn extends AppLocalizations {
       'Bundle device descriptors, parse results and recent logs to copy or export for the developer to debug DAC compatibility.';
 
   @override
+  String get importQuirkConfig => 'Import quirk config';
+
+  @override
+  String get importQuirkConfigDesc =>
+      'Paste the device quirk JSON from the developer; reconnect the device to apply';
+
+  @override
+  String get importAction => 'Import';
+
+  @override
+  String get importQuirkSuccess =>
+      'Quirk config imported; reconnect the device to apply';
+
+  @override
+  String get importQuirkFailed => 'Import failed';
+
+  @override
   String get generating => 'Generating…';
 
   @override

@@ -82,6 +82,11 @@ class MainActivity : AudioServiceActivity() {
                 "stopExclusivePlayback" -> result.success(usbExclusiveAudioEngine.stop())
                 "releaseExclusiveDevice" -> result.success(usbExclusiveAudioEngine.release())
                 "getUsbDiagnosticsReport" -> collectUsbDiagnosticsReport(result)
+                "importUsbDacQuirks" -> {
+                    val json = call.argument<String>("json") ?: ""
+                    val error = UsbDacQuirks.importOverride(this, json)
+                    result.success(mapOf("ok" to (error == null), "error" to error))
+                }
                 else -> result.notImplemented()
             }
         }

@@ -330,6 +330,13 @@ class _AudioOutputSettingsLayerState extends State<AudioOutputSettingsLayer> {
                   actionLabel: _generatingReport ? _l10n.generating : _l10n.generateReport,
                   onTap: _generatingReport ? null : _generateDiagnosticsReport,
                 ),
+                _actionTile(
+                  icon: Icons.tune_rounded,
+                  title: _l10n.importQuirkConfig,
+                  subtitle: _l10n.importQuirkConfigDesc,
+                  actionLabel: _l10n.importAction,
+                  onTap: _showImportQuirkSheet,
+                ),
               ],
             ),
           ],
@@ -1365,6 +1372,106 @@ class _AudioOutputSettingsLayerState extends State<AudioOutputSettingsLayer> {
           ),
         );
       },
+    );
+  }
+
+  void _showImportQuirkSheet() {
+    final controller = TextEditingController();
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      useRootNavigator: true,
+      builder: (sheetContext) {
+        return MySheet(
+          height: MediaQuery.heightOf(sheetContext) * 0.85,
+          Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 16, 16, 6),
+                child: Text(
+                  _l10n.importQuirkConfig,
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16),
+                child: Text(
+                  _l10n.importQuirkConfigDesc,
+                  style: TextStyle(
+                    color: textColor.value.withAlpha(150),
+                    fontSize: 12,
+                  ),
+                ),
+              ),
+              Expanded(
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      color: textColor.value.withAlpha(12),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: TextField(
+                      controller: controller,
+                      maxLines: null,
+                      expands: true,
+                      cursorColor: highlightTextColor.value,
+                      style: const TextStyle(
+                        fontFamily: 'monospace',
+                        fontSize: 11,
+                        height: 1.4,
+                      ),
+                      decoration: InputDecoration(
+                        border: InputBorder.none,
+                        contentPadding: const EdgeInsets.all(12),
+                        hintText: '{"version": 1, "devices": [...]}',
+                        hintStyle: TextStyle(
+                          color: textColor.value.withAlpha(100),
+                          fontFamily: 'monospace',
+                          fontSize: 11,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 20),
+                child: SizedBox(
+                  width: double.infinity,
+                  child: FilledButton.icon(
+                    onPressed: () => _importQuirks(sheetContext, controller.text),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: highlightTextColor.value,
+                      foregroundColor: menuColor.value,
+                    ),
+                    icon: const Icon(Icons.file_download_done_rounded, size: 18),
+                    label: Text(_l10n.importAction),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    ).then((_) => controller.dispose());
+  }
+
+  Future<void> _importQuirks(BuildContext sheetContext, String json) async {
+    final error = await usbAudioService.importDacQuirks(json.trim());
+    if (error == null && sheetContext.mounted) {
+      Navigator.of(sheetContext).pop();
+    }
+    if (!mounted) return;
+    ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+      SnackBar(
+        content: Text(
+          error == null
+              ? _l10n.importQuirkSuccess
+              : '${_l10n.importQuirkFailed}: $error',
+        ),
+        behavior: SnackBarBehavior.floating,
+      ),
     );
   }
 

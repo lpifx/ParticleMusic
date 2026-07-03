@@ -177,6 +177,26 @@ class UsbAudioService {
     return _invokeExclusiveState('releaseExclusiveDevice');
   }
 
+  /// 导入 quirk 配置 JSON（写入本地 override 文件，优先级高于内置 asset）。
+  /// 返回 null 表示成功，否则为错误描述。
+  Future<String?> importDacQuirks(String json) async {
+    if (!_isAndroid) {
+      return 'Only available on Android.';
+    }
+    try {
+      final result = await _channel.invokeMapMethod<String, Object?>(
+        'importUsbDacQuirks',
+        {'json': json},
+      );
+      if (result?['ok'] == true) {
+        return null;
+      }
+      return result?['error'] as String? ?? 'Unknown error.';
+    } on PlatformException catch (error) {
+      return error.message ?? error.code;
+    }
+  }
+
   /// 生成一键复制/导出的 DAC 适配诊断报告（纯文本 Markdown）。
   /// 报告不要求 DAC 在线：未连接设备时也会带上环境、偏好与最近日志。
   Future<String> getDiagnosticsReport() async {
@@ -783,6 +803,13 @@ String buildUsbDiagnosticsReport(
   _writeListSection(buffer, diagnostics['outputCandidates']);
   buffer.writeln('- UAC2 clock source id: ${diagnostics['clockSourceId'] ?? 'unknown'}');
   buffer.writeln('- Last probe: ${native['lastProbe'] ?? 'none'}');
+  buffer.writeln('### Quirk');
+  buffer.writeln('- Match: ${diagnostics['quirkMatch'] ?? 'unknown'}');
+  buffer.writeln('- Effective: ${diagnostics['quirkEffective'] ?? 'unknown'}');
+  final quirkErrors = diagnostics['quirkLoadErrors'];
+  if (quirkErrors is String && quirkErrors.isNotEmpty) {
+    buffer.writeln('- Load errors: $quirkErrors');
+  }
 
   // 5. System-side capability
   buffer.writeln();

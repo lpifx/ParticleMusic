@@ -1616,6 +1616,36 @@ abstract class AppLocalizations {
   /// **'Bundle device descriptors, parse results and recent logs to copy or export for the developer to debug DAC compatibility.'**
   String get generateDiagnosticsReportDesc;
 
+  /// No description provided for @importQuirkConfig.
+  ///
+  /// In en, this message translates to:
+  /// **'Import quirk config'**
+  String get importQuirkConfig;
+
+  /// No description provided for @importQuirkConfigDesc.
+  ///
+  /// In en, this message translates to:
+  /// **'Paste the device quirk JSON from the developer; reconnect the device to apply'**
+  String get importQuirkConfigDesc;
+
+  /// No description provided for @importAction.
+  ///
+  /// In en, this message translates to:
+  /// **'Import'**
+  String get importAction;
+
+  /// No description provided for @importQuirkSuccess.
+  ///
+  /// In en, this message translates to:
+  /// **'Quirk config imported; reconnect the device to apply'**
+  String get importQuirkSuccess;
+
+  /// No description provided for @importQuirkFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Import failed'**
+  String get importQuirkFailed;
+
   /// No description provided for @generating.
   ///
   /// In en, this message translates to:
