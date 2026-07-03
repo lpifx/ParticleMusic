@@ -737,6 +737,9 @@ class UsbExclusiveAudioEngine(
         val startMs = SystemClock.elapsedRealtime()
         var lastPositionEmitMs = 0L
         var packetizer: PcmIsoPacketizer? = null
+        // 流式独占当前应播位置（ms）与缓冲日志去重，语义同 writeRawPcm
+        var streamTargetMs = 0L
+        var streamBufferingLogged = false
 
         try {
             if (streaming) {
@@ -782,7 +785,7 @@ class UsbExclusiveAudioEngine(
             )
 
             if (mime == "audio/raw") {
-                writeRawPcm(extractor, file, format, sampleRate, channels, durationMs, target, startMs)
+                writeRawPcm(extractor, file, format, sampleRate, channels, durationMs, target, startMs, streaming)
                 return
             }
 
@@ -829,6 +832,8 @@ class UsbExclusiveAudioEngine(
                     sawInputEos = false
                     outputDone = false
                     lastPositionEmitMs = -1L
+                    streamTargetMs = seekMs
+                    streamBufferingLogged = false
                     updateState(
                         currentState + mapOf(
                             "active" to true,
@@ -849,6 +854,21 @@ class UsbExclusiveAudioEngine(
                             -1
                         }
                         if (sampleSize < 0) {
+                            if (streaming && file.exists()) {
+                                // 流式下载未完成，读到 -1 不是真 EOF：seek 落在未下载区或
+                                // 顺序播到当前下载末尾。空帧还回 input buffer，等下载推进后
+                                // 回到当前位置重探，绝不置 EOS 去跳下一首（跳歌会爆音）。
+                                codec.queueInputBuffer(inputIndex, 0, 0, 0, 0)
+                                if (!streamBufferingLogged) {
+                                    streamBufferingLogged = true
+                                    UsbDiagnostics.i(tag, "streaming decoder buffering at ${streamTargetMs}ms, waiting for download")
+                                }
+                                Thread.sleep(80)
+                                if (pendingSeekMs.get() < 0L) {
+                                    extractor.seekTo(streamTargetMs * 1000, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
+                                }
+                                continue
+                            }
                             codec.queueInputBuffer(
                                 inputIndex,
                                 0,
@@ -858,6 +878,7 @@ class UsbExclusiveAudioEngine(
                             )
                             sawInputEos = true
                         } else {
+                            streamBufferingLogged = false
                             codec.queueInputBuffer(
                                 inputIndex,
                                 0,
@@ -893,6 +914,7 @@ class UsbExclusiveAudioEngine(
                     } else {
                         SystemClock.elapsedRealtime() - startMs
                     }
+                    streamTargetMs = positionMs
                     if (positionMs - lastPositionEmitMs >= 250) {
                         lastPositionEmitMs = positionMs
                         updateState(
@@ -1187,6 +1209,7 @@ class UsbExclusiveAudioEngine(
         durationMs: Long?,
         target: OutputTarget,
         startMs: Long,
+        streaming: Boolean = false,
     ) {
         if (sampleRate == null || channels == null) {
             emitError("Raw PCM stream is missing sample rate or channel count.")
@@ -1220,6 +1243,10 @@ class UsbExclusiveAudioEngine(
         var lastPositionEmitMs = 0L
         var lastSampleTimeUs: Long? = null
         var rawChunkLogCount = 0
+        // 流式独占当前应播位置（ms）：读到已下载末尾或 seek 落在未下载区时，
+        // 回到这里重试，绝不误判成播放结束去跳下一首
+        var streamTargetMs = 0L
+        var streamBufferingLogged = false
 
         UsbDiagnostics.i(
             tag,
@@ -1261,6 +1288,8 @@ class UsbExclusiveAudioEngine(
                 packetizer.reset()
                 lastPositionEmitMs = -1L
                 lastSampleTimeUs = null
+                streamTargetMs = seekMs
+                streamBufferingLogged = false
                 updateState(
                     currentState + mapOf(
                         "active" to true,
@@ -1275,8 +1304,25 @@ class UsbExclusiveAudioEngine(
             val sampleTimeUs = extractor.sampleTime
             val sampleSize = extractor.readSampleData(buffer, 0)
             if (sampleSize < 0) {
+                // 流式下载没结束时，读到 -1 不是真 EOF：多半是 seek 落在尚未下载的
+                // 区段，或顺序播到了当前下载末尾。等下载推进后回到当前位置重探，
+                // 绝不当成播完去跳下一首（跳歌会重建会话、DAC 重锁并爆音）。
+                // 循环顶部照常响应停止/暂停/新的用户 seek，不会卡死。
+                if (streaming && file.exists()) {
+                    if (!streamBufferingLogged) {
+                        streamBufferingLogged = true
+                        UsbDiagnostics.i(tag, "streaming raw PCM buffering at ${streamTargetMs}ms, waiting for download")
+                    }
+                    Thread.sleep(80)
+                    // 没有更新的用户 seek 时重探当前位置；有的话留给顶部消费新目标
+                    if (pendingSeekMs.get() < 0L) {
+                        extractor.seekTo(streamTargetMs * 1000, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
+                    }
+                    continue
+                }
                 break
             }
+            streamBufferingLogged = false
             val data = ByteArray(sampleSize)
             buffer.position(0)
             buffer.limit(sampleSize)
@@ -1294,6 +1340,9 @@ class UsbExclusiveAudioEngine(
                 rawChunkLogCount++
             }
             lastSampleTimeUs = sampleTimeUs
+            if (sampleTimeUs > 0) {
+                streamTargetMs = sampleTimeUs / 1000
+            }
             packetizer.write(data)
 
             val positionMs = if (sampleTimeUs > 0) {
