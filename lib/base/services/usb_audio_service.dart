@@ -348,6 +348,9 @@ class UsbExclusivePlaybackRequest {
   final String? sourceFormat;
   final int? sampleRate;
   final int? bitDepth;
+
+  /// DSD 文件的输出模式（UsbDsdMode.name：dop/native），非 DSD 为 null
+  final String? dsdMode;
   final int? targetBufferMs;
   final bool startPaused;
 
@@ -357,6 +360,7 @@ class UsbExclusivePlaybackRequest {
     required this.sourceFormat,
     required this.sampleRate,
     required this.bitDepth,
+    this.dsdMode,
     required this.targetBufferMs,
     required this.startPaused,
   });
@@ -368,6 +372,7 @@ class UsbExclusivePlaybackRequest {
       'sourceFormat': sourceFormat,
       'sampleRate': sampleRate,
       'bitDepth': bitDepth,
+      'dsdMode': dsdMode,
       'targetBufferMs': targetBufferMs,
       'startPaused': startPaused,
     };

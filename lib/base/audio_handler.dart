@@ -682,6 +682,15 @@ class MyAudioHandler extends BaseAudioHandler with WidgetsBindingObserver {
       return false;
     }
 
+    final isDsd = song.isDsd;
+    if (isDsd &&
+        usbAudioPreferences.dsdModeNotifier.value == UsbDsdMode.pcm) {
+      // DSD 模式=PCM：由共享路径（mpv/libavcodec）解码转 PCM，不进独占直驱
+      logger.output("usb exclusive skipped:dsd pcm mode -> shared output");
+      debugPrint("usb exclusive skipped:dsd pcm mode -> shared output");
+      return false;
+    }
+
     final capability = await usbAudioService.getExclusiveCapabilities();
     var exclusiveCapability = capability;
     if (exclusiveCapability.available &&
@@ -708,8 +717,11 @@ class MyAudioHandler extends BaseAudioHandler with WidgetsBindingObserver {
       return false;
     }
 
-    final exclusiveSampleRate = _preferredExclusiveSampleRate(song);
-    if (exclusiveSampleRate == null) {
+    // DSD 走 DoP 时输出帧率由引擎按文件头计算（DSD 速率 ÷ 16），不做采样率白名单校验
+    final exclusiveSampleRate = isDsd
+        ? null
+        : _preferredExclusiveSampleRate(song);
+    if (!isDsd && exclusiveSampleRate == null) {
       // 源采样率无法在独占直驱下与 DAC 时钟对齐（没有 SRC），干净回退到系统输出而不是变调播放。
       logger.output(
         "usb exclusive fallback:unsupported source samplerate=${song.samplerate}",
@@ -726,7 +738,8 @@ class MyAudioHandler extends BaseAudioHandler with WidgetsBindingObserver {
         title: getTitle(song),
         sourceFormat: _normalizedExclusiveFormat(song),
         sampleRate: exclusiveSampleRate,
-        bitDepth: _preferredExclusiveBitDepth(),
+        bitDepth: isDsd ? null : _preferredExclusiveBitDepth(),
+        dsdMode: isDsd ? usbAudioPreferences.dsdModeNotifier.value.name : null,
         targetBufferMs: _exclusiveTargetBufferMsForLifecycle(
           WidgetsBinding.instance.lifecycleState,
         ),
@@ -769,12 +782,16 @@ class MyAudioHandler extends BaseAudioHandler with WidgetsBindingObserver {
     if (format != null && format.isNotEmpty) {
       if (format.contains('flac')) return 'flac';
       if (format.contains('wav') || format.contains('wave')) return 'wav';
+      if (format.contains('dsf')) return 'dsf';
+      if (format.contains('dff')) return 'dff';
       return format;
     }
 
     final path = (song.cachePath ?? song.path ?? '').toLowerCase();
     if (path.endsWith('.flac')) return 'flac';
     if (path.endsWith('.wav') || path.endsWith('.wave')) return 'wav';
+    if (path.endsWith('.dsf')) return 'dsf';
+    if (path.endsWith('.dff')) return 'dff';
     return null;
   }
 
@@ -840,6 +857,16 @@ class MyAudioHandler extends BaseAudioHandler with WidgetsBindingObserver {
     }
   }
 
+  int? _dsdPcmTargetRate(MyAudioMetadata song) {
+    return switch (song.dsdMultiple) {
+      64 => usbAudioPreferences.dsd64PcmRateNotifier.value,
+      128 => usbAudioPreferences.dsd128PcmRateNotifier.value,
+      256 => usbAudioPreferences.dsd256PcmRateNotifier.value,
+      512 => usbAudioPreferences.dsd512PcmRateNotifier.value,
+      _ => null,
+    };
+  }
+
   int? _matchedSafeSampleRate(int? sourceSampleRate) {
     if (sourceSampleRate == null || sourceSampleRate <= 0) {
       return null;
@@ -869,6 +896,13 @@ class MyAudioHandler extends BaseAudioHandler with WidgetsBindingObserver {
     UsbAudioStatus status,
     MyAudioMetadata song,
   ) {
+    // DSD 转 PCM 走共享输出时，按 DSD 倍率对应的偏好请求目标输出率
+    //（这是"目标输出率请求"，精确转换由解码器/系统混音器完成）
+    final dsdPcmRate = _dsdPcmTargetRate(song);
+    if (dsdPcmRate != null && _statusSupportsSampleRate(status, dsdPcmRate)) {
+      return dsdPcmRate;
+    }
+
     final fixedRate = usbAudioPreferences.preferredFixedSampleRate();
     if (fixedRate != null) {
       return fixedRate;

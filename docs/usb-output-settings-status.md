@@ -14,7 +14,7 @@
 | USB 独占播放状态 | 已接入快照 | `UsbExclusivePlaybackState` 会由 start/pause/resume/seek/stop 等 native 调用回传，页面监听这个 notifier 展示当前快照。它不是连续实时水位。 |
 | 后台保活 | 已接入偏好 | 偏好已持久化，并用于 App 内 USB 输出策略判断；是否能完全防止系统杀后台取决于系统电池策略。 |
 | 播放后释放 USB 带宽 | 已接入偏好 | 偏好已保存，供停止播放后释放 USB 资源策略使用。 |
-| DSD 模式和 DSD 转 PCM 采样率 | 已接入偏好 | `PCM / DoP / Native` 和 DSD64/128/256/512 转 PCM 目标采样率均已持久化。底层 Native DSD/DoP 是否真正输出取决于后续独占链路实现。 |
+| DSD 模式和 DSD 转 PCM 采样率 | 部分接入 | `.dsf/.dff` 已进曲库（`dsd_metadata.dart` 手工解析头部与 DSF 尾部 ID3）。`PCM` 模式：DSD 文件不进独占，由共享路径（mpv）解码转 PCM，DSD64/128/256/512 转 PCM 目标采样率作为系统 preferred output 请求生效。`DoP` 模式：独占链路已实现（`DsdFileReader`→`DopPacketizer`→ISO 打包，时钟设为 DSD 速率÷16，需设备提供 24/32-bit alt），暂停发 DoP 封装的 0x69 静音、seek 丢弃在途 URB。`Native` 暂未实现，选中时引擎报不支持并回退。 |
 | 音量锁定和 DSD 增益补偿 | 已接入偏好 | 设置已持久化，供播放链路读取；硬件音量实时检测暂未接入。 |
 
 ## 参考或占位项

@@ -14,6 +14,7 @@ import android.os.Build
 import android.os.SystemClock
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.IOException
 import java.nio.ByteBuffer
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
@@ -46,6 +47,8 @@ object UsbExclusiveNative {
     external fun transportTelemetry(): LongArray
 
     external fun setMaxPendingOutputUrbs(maxPendingUrbs: Int)
+
+    external fun flushOutput(): String?
 
     external fun close()
 }
@@ -148,20 +151,53 @@ class UsbExclusiveAudioEngine(
         )
 
         if (!isSupportedFile(filePath, sourceFormat)) {
-            return updateState(inactiveState("Exclusive playback currently supports FLAC and WAV only."))
+            return updateState(inactiveState("Exclusive playback currently supports FLAC, WAV and DSD (.dsf/.dff) only."))
         }
 
-        val requestedSampleRate = (arguments["sampleRate"] as? Number)?.toInt()
-        val requestedBitDepth = (arguments["bitDepth"] as? Number)?.toInt()
+        // DSD 文件目前独占链路只支持 DoP 输出；pcm 模式在 Dart 侧直接走共享路径，不会到这里
+        val dsdMode = (arguments["dsdMode"] as? String)?.lowercase(Locale.ROOT)
+        var dsdReader: DsdFileReader? = null
+        if (isDsdFile(filePath, sourceFormat)) {
+            if (dsdMode != "dop") {
+                return updateState(
+                    inactiveState(
+                        "DSD over USB exclusive currently requires DoP mode (current: ${dsdMode ?: "unset"}).",
+                    ),
+                )
+            }
+            dsdReader = try {
+                DsdFileReader.open(file)
+            } catch (error: IOException) {
+                return updateState(inactiveState(error.message ?: "Failed to parse DSD file."))
+            }
+            UsbDiagnostics.i(
+                tag,
+                "DSD source rate=${dsdReader.sampleRate} (DSD${dsdReader.dsdMultiple ?: "?"}), " +
+                    "channels=${dsdReader.channels}, container=${dsdReader.formatName}, " +
+                    "dopFrameRate=${dsdReader.dopFrameRate}",
+            )
+        }
+
+        // DoP 的输出帧率 = DSD 速率 ÷ 16，位深要求 24/32-bit slot（选中候选后再校验）
+        val requestedSampleRate = dsdReader?.dopFrameRate
+            ?: (arguments["sampleRate"] as? Number)?.toInt()
+        val requestedBitDepth = if (dsdReader != null) {
+            null
+        } else {
+            (arguments["bitDepth"] as? Number)?.toInt()
+        }
         targetBufferMs = ((arguments["targetBufferMs"] as? Number)?.toInt() ?: 200).coerceIn(50, 5000)
         minimumBufferLevelMs = null
         lastTelemetryEmitMs = 0L
         lastTelemetryBufferMs = null
         zeroBufferUnderruns = 0L
         activePacketsPerSecond = 0
-        val requestedChannels = 2
+        val requestedChannels = dsdReader?.channels ?: 2
         val openedConnection = usbManager.openDevice(device)
-            ?: return updateState(inactiveState("Failed to open USB device for exclusive playback."))
+            ?: run {
+                dsdReader?.close()
+                return updateState(inactiveState("Failed to open USB device for exclusive playback."))
+            }
         val descriptors = openedConnection.rawDescriptors
         val streamingFormats = parseStreamingFormatInfo(descriptors)
         val target = findOutputTarget(
@@ -173,8 +209,21 @@ class UsbExclusiveAudioEngine(
         )
             ?: run {
                 openedConnection.close()
+                dsdReader?.close()
                 return updateState(inactiveState("No isochronous USB Audio OUT endpoint was found."))
             }
+        if (dsdReader != null && target.usbBytesPerSample < 3) {
+            // 16-bit slot 无法承载 DoP 的 8 位标记 + 16 位数据
+            openedConnection.close()
+            dsdReader.close()
+            return updateState(
+                inactiveState(
+                    "DoP requires a 24/32-bit output slot, but the device only exposes " +
+                        "${target.usbBitResolution ?: target.usbBytesPerSample * 8}-bit at " +
+                        "${requestedSampleRate}Hz.",
+                ),
+            )
+        }
         UsbDiagnostics.i(
             tag,
             "exclusive target interface=${target.usbInterface.id}, alt=${target.alternateSetting}, " +
@@ -196,6 +245,7 @@ class UsbExclusiveAudioEngine(
         )
         if (openError != null) {
             openedConnection.close()
+            dsdReader?.close()
             return updateState(inactiveState(openError))
         }
         UsbDiagnostics.i(tag, "native USB exclusive endpoint opened.")
@@ -205,6 +255,7 @@ class UsbExclusiveAudioEngine(
             if (clockError != null) {
                 UsbExclusiveNative.close()
                 openedConnection.close()
+                dsdReader?.close()
                 return updateState(inactiveState(clockError))
             }
         }
@@ -214,21 +265,31 @@ class UsbExclusiveAudioEngine(
         stopped.set(false)
         pendingSeekMs.set(-1L)
 
+        // DoP 激活时 state 报 DSD 语义：sampleRate=DSD 速率、bitDepth=1、format 带 (DoP) 后缀
         val initialState = mapOf(
             "active" to true,
             "playing" to !paused.get(),
             "positionMs" to 0,
-            "durationMs" to null,
-            "sampleRate" to arguments["sampleRate"],
-            "bitDepth" to arguments["bitDepth"],
-            "format" to (sourceFormat ?: file.extension.lowercase(Locale.ROOT)),
+            "durationMs" to dsdReader?.durationMs,
+            "sampleRate" to (dsdReader?.sampleRate ?: arguments["sampleRate"]),
+            "bitDepth" to if (dsdReader != null) 1 else arguments["bitDepth"],
+            "format" to if (dsdReader != null) {
+                "${dsdReader.formatName}(DoP)"
+            } else {
+                sourceFormat ?: file.extension.lowercase(Locale.ROOT)
+            },
             "message" to "USB exclusive playback prepared.",
         )
         updateState(initialState)
         emitTransportTelemetry(target.packetsPerSecond, force = true)
 
+        val reader = dsdReader
         worker = Thread({
-            decodeAndWrite(file, target)
+            if (reader != null) {
+                dopDecodeAndWrite(reader, target)
+            } else {
+                decodeAndWrite(file, target)
+            }
         }, "SylvakruUsbExclusive")
         worker?.start()
         return currentState
@@ -455,6 +516,10 @@ class UsbExclusiveAudioEngine(
                 consumePendingSeekMs()?.let { seekMs ->
                     val seekUs = seekMs * 1000
                     UsbDiagnostics.i(tag, "exclusive decoder seek to ${seekMs}ms.")
+                    // 丢弃在途 URB，seek 立即生效而不是等旧缓冲放完
+                    UsbExclusiveNative.flushOutput()?.let { flushError ->
+                        UsbDiagnostics.w(tag, "flush before seek failed: $flushError")
+                    }
                     extractor.seekTo(seekUs, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
                     codec.flush()
                     packetizer?.reset()
@@ -599,6 +664,96 @@ class UsbExclusiveAudioEngine(
         }
     }
 
+    /**
+     * DSD 文件的 DoP 输出主循环：DsdFileReader → DopPacketizer → 现有 PcmIsoPacketizer。
+     * DoP 帧被当作普通 24-bit PCM 打包（帧率 = DSD 速率 ÷ 16），24→32 slot 的高位对齐
+     * 恰好满足 DoP 低 8 位补零的要求，传输层零改动。
+     * 关键约束：DoP 路径上不允许任何 DSP（音量/抖动/重采样都会破坏标记、输出全幅噪声）；
+     * 暂停时必须持续发 DoP 封装的 0x69 静音——发 PCM 零或停流会让 DAC 掉出 DSD 模式并可能爆音。
+     */
+    private fun dopDecodeAndWrite(reader: DsdFileReader, target: OutputTarget) {
+        var lastPositionEmitMs = 0L
+        val dop = DopPacketizer(reader.channels)
+        try {
+            val packetizer = createPacketizer(reader.dopFrameRate, reader.channels, 24, target)
+            updateState(
+                currentState + mapOf(
+                    "active" to true,
+                    "playing" to !paused.get(),
+                    "durationMs" to reader.durationMs,
+                    "sampleRate" to reader.sampleRate,
+                    "bitDepth" to 1,
+                    "message" to "USB exclusive DoP streaming DSD${reader.dsdMultiple ?: ""} " +
+                        "(${reader.formatName}) to ${target.endpointLabel}.",
+                ),
+            )
+
+            // 单次读写约 10 ms 的量；写满水位后由 native 阻塞回收自然限速
+            val silenceFramesPerWrite = maxOf(1, reader.dopFrameRate / 100)
+            val buffer = ByteArray(reader.channels * 2 * silenceFramesPerWrite)
+
+            while (!stopped.get()) {
+                consumePendingSeekMs()?.let { seekMs ->
+                    // 先丢弃在途 URB 让 seek 立即生效，再同步复位 DoP 标记相位与打包器
+                    UsbExclusiveNative.flushOutput()?.let { flushError ->
+                        UsbDiagnostics.w(tag, "flush before DoP seek failed: $flushError")
+                    }
+                    packetizer.reset()
+                    dop.reset()
+                    val actualMs = reader.seekTo(seekMs)
+                    lastPositionEmitMs = -1L
+                    updateState(
+                        currentState + mapOf(
+                            "active" to true,
+                            "playing" to !paused.get(),
+                            "positionMs" to actualMs,
+                            "message" to "Seeked.",
+                        ),
+                    )
+                }
+
+                if (paused.get()) {
+                    packetizer.write(dop.encodeSilence(silenceFramesPerWrite))
+                    continue
+                }
+
+                val count = reader.read(buffer)
+                if (count < 0) {
+                    // 结尾不足一帧的余量补 0x69，再垫一小段静音把尾部数据完整送出
+                    packetizer.write(dop.drain())
+                    packetizer.write(dop.encodeSilence(silenceFramesPerWrite))
+                    packetizer.flush()
+                    break
+                }
+                packetizer.write(dop.encode(buffer, count))
+
+                val positionMs = reader.positionMs
+                if (positionMs - lastPositionEmitMs >= 250) {
+                    lastPositionEmitMs = positionMs
+                    updateState(
+                        currentState + mapOf(
+                            "active" to true,
+                            "playing" to !paused.get(),
+                            "positionMs" to positionMs,
+                        ),
+                    )
+                }
+            }
+
+            if (!stopped.get()) {
+                updateState(inactiveState("USB exclusive playback completed."))
+            }
+        } catch (error: Throwable) {
+            UsbDiagnostics.w(tag, "Exclusive DoP playback failed.", error)
+            emitError(error.message ?: "USB exclusive DoP playback failed.")
+        } finally {
+            runCatching { reader.close() }
+            UsbExclusiveNative.close()
+            connection?.close()
+            connection = null
+        }
+    }
+
     private fun writeRawPcm(
         extractor: MediaExtractor,
         file: File,
@@ -676,6 +831,10 @@ class UsbExclusiveAudioEngine(
             consumePendingSeekMs()?.let { seekMs ->
                 val seekUs = seekMs * 1000
                 UsbDiagnostics.i(tag, "exclusive raw PCM seek to ${seekMs}ms.")
+                // 丢弃在途 URB，seek 立即生效而不是等旧缓冲放完
+                UsbExclusiveNative.flushOutput()?.let { flushError ->
+                    UsbDiagnostics.w(tag, "flush before seek failed: $flushError")
+                }
                 extractor.seekTo(seekUs, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
                 packetizer.reset()
                 lastPositionEmitMs = -1L
@@ -1382,8 +1541,19 @@ class UsbExclusiveAudioEngine(
         if (sourceFormat == "flac" || sourceFormat == "wav" || sourceFormat == "wave") {
             return true
         }
+        if (isDsdFile(filePath, sourceFormat)) {
+            return true
+        }
         val lower = filePath.lowercase(Locale.ROOT)
         return lower.endsWith(".flac") || lower.endsWith(".wav") || lower.endsWith(".wave")
+    }
+
+    private fun isDsdFile(filePath: String, sourceFormat: String?): Boolean {
+        if (sourceFormat == "dsf" || sourceFormat == "dff") {
+            return true
+        }
+        val lower = filePath.lowercase(Locale.ROOT)
+        return lower.endsWith(".dsf") || lower.endsWith(".dff")
     }
 
     private fun capability(
