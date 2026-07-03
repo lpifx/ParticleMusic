@@ -96,8 +96,14 @@ class UsbExclusiveAudioEngine(
     private var sessionTarget: OutputTarget? = null
     @Volatile private var sessionBroken = false
 
-    // DoP 会话在切歌空窗期垫 0x69 静音用（写线程退出后由主线程调用，无并发）
-    @Volatile private var dopIdleFill: (() -> Unit)? = null
+    // DoP 标记相位跨曲目/跨空窗延续：打包器提升到会话级，写线程与空窗静音
+    // 线程（互斥，先 join 再启动）共用。DAC 看到的 DoP 流一旦中断就会掉回
+    // PCM 模式再重新锁定（指示灯蓝→绿→蓝），伴随继电器/模式切换的咔嗒声。
+    @Volatile private var sessionDop: DopPacketizer? = null
+    @Volatile private var sessionPacketizer: PcmIsoPacketizer? = null
+    @Volatile private var workerEndedAtEof = false
+    private val idleFillerRunning = AtomicBoolean(false)
+    private var idleFillerThread: Thread? = null
 
     fun capabilities(usbManager: UsbManager, device: UsbDevice?): Map<String, Any?> {
         if (!NATIVE_USB_EXCLUSIVE_STREAMING_ENABLED) {
@@ -261,9 +267,13 @@ class UsbExclusiveAudioEngine(
         if (reuseSession) {
             target = sessionTarget!!
             mainHandler.removeCallbacks(deferredCloseRunnable)
-            // 只丢上一首的在途 URB，接口/altsetting/时钟原样保留
-            UsbExclusiveNative.flushOutput()?.let { flushError ->
-                UsbDiagnostics.w(tag, "flush on session reuse failed: $flushError")
+            stopDopIdleFiller()
+            if (!workerEndedAtEof) {
+                // 手动切歌才丢在途 URB；自然播完不 flush，缓冲里垫着的静音
+                // 让下一首无缝续上，DoP 标记不断
+                UsbExclusiveNative.flushOutput()?.let { flushError ->
+                    UsbDiagnostics.w(tag, "flush on session reuse failed: $flushError")
+                }
             }
             UsbDiagnostics.i(
                 tag,
@@ -354,7 +364,7 @@ class UsbExclusiveAudioEngine(
             target = resolvedTarget
         }
         sessionBroken = false
-        dopIdleFill = null
+        workerEndedAtEof = false
         paused.set(arguments["startPaused"] == true)
         stopped.set(false)
         pendingSeekMs.set(-1L)
@@ -435,17 +445,16 @@ class UsbExclusiveAudioEngine(
     fun stop(): Map<String, Any?> {
         val keepSession = stopWorkerKeepingSession()
         if (keepSession && connection != null) {
-            // 立即丢在途 URB 让停止即时生效；DoP 会话垫一小段 0x69 静音，
-            // 空窗期 DAC 停留在 DSD 模式等下一首；会话延迟关闭
-            UsbExclusiveNative.flushOutput()?.let { flushError ->
-                UsbDiagnostics.w(tag, "flush on stop failed: $flushError")
-            }
-            dopIdleFill?.let { fill ->
-                runCatching { fill() }.onFailure { error ->
-                    UsbDiagnostics.w(tag, "DoP idle fill failed: ${error.message}")
-                    hardCloseSession("DoP idle fill failed")
+            if (!workerEndedAtEof) {
+                // 手动停止/切歌：丢在途 URB 让停止即时生效；自然播完不 flush，
+                // 缓冲里垫着的静音继续放，DoP 标记不断
+                UsbExclusiveNative.flushOutput()?.let { flushError ->
+                    UsbDiagnostics.w(tag, "flush on stop failed: $flushError")
                 }
             }
+            // 空窗期持续垫 DoP 静音直到下一首接管或延迟关闭（自然播完时
+            // 写线程退出前已启动，重复调用无副作用）
+            startDopIdleFiller()
             scheduleDeferredClose()
         }
         return updateState(inactiveState("USB exclusive playback stopped."))
@@ -483,13 +492,50 @@ class UsbExclusiveAudioEngine(
         mainHandler.postDelayed(deferredCloseRunnable, 4000L)
     }
 
+    // 空窗期（切歌/停止后）持续垫 DoP 静音：与写线程互斥（先 join 再启动），
+    // 标记相位由 sessionDop 延续，DAC 始终收到合法 DoP 流，不掉回 PCM 模式
+    private fun startDopIdleFiller() {
+        val dop = sessionDop ?: return
+        val packetizer = sessionPacketizer ?: return
+        val frameRate = sessionSampleRate ?: return
+        if (idleFillerThread?.isAlive == true) {
+            return
+        }
+        idleFillerRunning.set(true)
+        val thread = Thread({
+            // 单次约 10ms 的量，写满水位由 native 阻塞回收自然限速
+            val frames = maxOf(1, frameRate / 100)
+            try {
+                while (idleFillerRunning.get()) {
+                    packetizer.write(dop.encodeSilence(frames))
+                }
+            } catch (error: Throwable) {
+                // 会话已断（拔线/被关），交给延迟关闭兜底
+                UsbDiagnostics.w(tag, "DoP idle filler exit: ${error.message}")
+            }
+        }, "SylvakruUsbDopIdleFill")
+        idleFillerThread = thread
+        thread.start()
+    }
+
+    private fun stopDopIdleFiller() {
+        idleFillerRunning.set(false)
+        val thread = idleFillerThread ?: return
+        idleFillerThread = null
+        if (thread != Thread.currentThread()) {
+            thread.join(500)
+        }
+    }
+
     private fun hardCloseSession(reason: String) {
         if (connection == null && sessionTarget == null) {
             return
         }
         UsbDiagnostics.i(tag, "close exclusive USB session: $reason")
         mainHandler.removeCallbacks(deferredCloseRunnable)
-        dopIdleFill = null
+        stopDopIdleFiller()
+        sessionDop = null
+        sessionPacketizer = null
         sessionTarget = null
         sessionDeviceId = null
         sessionSampleRate = null
@@ -798,6 +844,7 @@ class UsbExclusiveAudioEngine(
             UsbDiagnostics.i(tag, "exclusive decode reached end of stream, flushing remainder.")
             packetizer?.flush()
             if (!stopped.get()) {
+                workerEndedAtEof = true
                 updateState(inactiveState("USB exclusive playback completed."))
             }
         } catch (error: Throwable) {
@@ -884,9 +931,16 @@ class UsbExclusiveAudioEngine(
         // 流式下载中的缓冲恢复水位：饥饿后攒到该长度才继续读，避免走走停停
         var streamingResumeBytes = 0L
         var streamingBufferingLogged = false
-        val dop = DopPacketizer(reader.channels)
+        // 标记相位跨曲目延续：会话存活期间复用同一 DopPacketizer 与打包器
+        val dop = sessionDop ?: DopPacketizer(reader.channels).also { sessionDop = it }
         try {
-            val packetizer = createPacketizer(reader.dopFrameRate, reader.channels, 24, target)
+            val packetizer = sessionPacketizer
+                ?.also {
+                    activePacketsPerSecond = target.packetsPerSecond
+                    applyNativeTargetBuffer(target.packetsPerSecond)
+                }
+                ?: createPacketizer(reader.dopFrameRate, reader.channels, 24, target)
+                    .also { sessionPacketizer = it }
             updateState(
                 currentState + mapOf(
                     "active" to true,
@@ -903,20 +957,17 @@ class UsbExclusiveAudioEngine(
             val silenceFramesPerWrite = maxOf(1, reader.dopFrameRate / 100)
             val buffer = ByteArray(reader.channels * 2 * silenceFramesPerWrite)
 
-            // 切歌空窗期由主线程垫约 200ms DoP 静音，DAC 不掉出 DSD 模式
-            dopIdleFill = {
-                packetizer.write(dop.encodeSilence(silenceFramesPerWrite * 20))
-                packetizer.flush()
-            }
-
             while (!stopped.get()) {
                 consumePendingSeekMs()?.let { seekMs ->
-                    // 先丢弃在途 URB 让 seek 立即生效，再同步复位 DoP 标记相位与打包器
+                    // 先丢弃在途 URB 让 seek 立即生效，复位打包器与标记相位后
+                    // 立刻垫一小段静音——文件定位期间标记流不断，DAC 不掉出
+                    // DSD 模式（掉锁再回锁就是 seek 咔嗒声的来源）
                     UsbExclusiveNative.flushOutput()?.let { flushError ->
                         UsbDiagnostics.w(tag, "flush before DoP seek failed: $flushError")
                     }
                     packetizer.reset()
                     dop.reset()
+                    packetizer.write(dop.encodeSilence(silenceFramesPerWrite * 3))
                     val actualMs = reader.seekTo(seekMs)
                     lastPositionEmitMs = -1L
                     updateState(
@@ -984,6 +1035,7 @@ class UsbExclusiveAudioEngine(
 
             UsbDiagnostics.i(tag, "exclusive DoP playback reached end of stream.")
             if (!stopped.get()) {
+                workerEndedAtEof = true
                 updateState(inactiveState("USB exclusive playback completed."))
             }
         } catch (error: Throwable) {
@@ -995,7 +1047,11 @@ class UsbExclusiveAudioEngine(
             if (sessionBroken) {
                 hardCloseSession("DoP worker failed")
             } else {
-                // 会话留给下一首热复用，短时间内没有新的 start 再关
+                // 会话留给下一首热复用；自然播完立即接上空窗静音填充，
+                // 短时间内没有新的 start 再由延迟关闭拆链路
+                if (workerEndedAtEof) {
+                    startDopIdleFiller()
+                }
                 scheduleDeferredClose()
             }
         }
@@ -1142,6 +1198,7 @@ class UsbExclusiveAudioEngine(
         UsbDiagnostics.i(tag, "exclusive raw PCM reached end of stream, flushing remainder.")
         packetizer.flush()
         if (!stopped.get()) {
+            workerEndedAtEof = true
             updateState(inactiveState("USB exclusive playback completed."))
         }
     }
