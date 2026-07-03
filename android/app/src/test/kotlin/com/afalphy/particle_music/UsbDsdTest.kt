@@ -202,6 +202,53 @@ class UsbDsdTest {
     }
 
     @Test
+    fun dffStreamingUsesDeclaredSizeAndGatesReads() {
+        val audio = ByteArray(64) { it.toByte() }
+        val full = buildDff(2, 8000, "DSD ", audio)
+        val fullBytes = full.readBytes()
+        val dataStart = fullBytes.size - audio.size
+        // 只写入头部 + 前 4 字节数据，模拟仍在下载的 .part 文件
+        val part = temporaryFolder.newFile("stream.dff")
+        part.writeBytes(fullBytes.copyOfRange(0, dataStart + 4))
+
+        DsdFileReader.open(part, streaming = true).use { reader ->
+            // 时长按 chunk 头声明值取，而不是当前文件长度（每通道 32 字节 → 32 ms）
+            assertEquals(32, reader.durationMs)
+            assertTrue(reader.canReadAt(part.length()))
+            val buffer = ByteArray(4)
+            assertEquals(4, reader.read(buffer))
+            // 下一帧还没下载到，不能读（否则会被误判成文件结尾）
+            assertTrue(!reader.canReadAt(part.length()))
+            // 模拟下载完成：其余数据就位后能一直读到声明的结尾
+            part.writeBytes(fullBytes)
+            assertTrue(reader.canReadAt(part.length()))
+            assertEquals(60, readAll(reader).size)
+        }
+    }
+
+    @Test
+    fun dsfStreamingCanReadAtRequiresFullBlockGroup() {
+        val perChannel = ByteArray(8) { (it + 1).toByte() }
+        val full = buildDsf(2, 2822400, 8, 4, listOf(perChannel, perChannel))
+        val fullBytes = full.readBytes()
+        val dataStart = fullBytes.size - 16
+        // 第一个块组完整，第二个块组缺最后 1 字节
+        val part = temporaryFolder.newFile("stream.dsf")
+        part.writeBytes(fullBytes.copyOfRange(0, dataStart + 8 + 7))
+
+        DsdFileReader.open(part, streaming = true).use { reader ->
+            assertTrue(reader.canReadAt(part.length()))
+            val buffer = ByteArray(8)
+            assertEquals(8, reader.read(buffer))
+            // 第二块组按 planar 布局需要 (channels-1)×blockSize+valid 字节齐全
+            assertTrue(!reader.canReadAt(part.length()))
+            part.writeBytes(fullBytes)
+            assertTrue(reader.canReadAt(part.length()))
+            assertEquals(8, reader.read(buffer))
+        }
+    }
+
+    @Test
     fun dffDstCompressionIsRejected() {
         val file = buildDff(2, 2822400, "DST ", ByteArray(8))
         try {

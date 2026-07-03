@@ -8,6 +8,7 @@ import android.hardware.usb.UsbEndpoint
 import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
 import android.media.MediaCodec
+import android.media.MediaDataSource
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.os.Build
@@ -15,6 +16,7 @@ import android.os.SystemClock
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
+import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
@@ -154,6 +156,10 @@ class UsbExclusiveAudioEngine(
             return updateState(inactiveState("Exclusive playback currently supports FLAC, WAV and DSD (.dsf/.dff) only."))
         }
 
+        // 流式独占：file 是仍在下载增长的 .part 文件，下载完成时会被改名为正式
+        // 缓存名（已打开的 fd 不受影响）。数据没跟上时按"暂停"处理，绝不断流爆音。
+        val streaming = arguments["streaming"] == true
+
         // 该设备的 quirk 生效值（vid:pid 精确 → vid:* 厂商 → 默认）
         val quirk = UsbDacQuirks.forDevice(context, device.vendorId, device.productId)
 
@@ -178,7 +184,7 @@ class UsbExclusiveAudioEngine(
                 )
             }
             dsdReader = try {
-                DsdFileReader.open(file)
+                DsdFileReader.open(file, streaming)
             } catch (error: IOException) {
                 return updateState(inactiveState(error.message ?: "Failed to parse DSD file."))
             }
@@ -208,6 +214,10 @@ class UsbExclusiveAudioEngine(
             (arguments["bitDepth"] as? Number)?.toInt()
         }
         targetBufferMs = ((arguments["targetBufferMs"] as? Number)?.toInt() ?: 200).coerceIn(50, 5000)
+        if (streaming) {
+            // 流式播放用更深的 USB 水位吸收下载抖动
+            targetBufferMs = maxOf(targetBufferMs, 1000)
+        }
         minimumBufferLevelMs = null
         lastTelemetryEmitMs = 0L
         lastTelemetryBufferMs = null
@@ -313,9 +323,9 @@ class UsbExclusiveAudioEngine(
         val reader = dsdReader
         worker = Thread({
             if (reader != null) {
-                dopDecodeAndWrite(reader, target)
+                dopDecodeAndWrite(reader, target, if (streaming) file else null)
             } else {
-                decodeAndWrite(file, target)
+                decodeAndWrite(file, target, streaming)
             }
         }, "SylvakruUsbExclusive")
         worker?.start()
@@ -455,9 +465,10 @@ class UsbExclusiveAudioEngine(
         )
     }
 
-    private fun decodeAndWrite(file: File, target: OutputTarget) {
+    private fun decodeAndWrite(file: File, target: OutputTarget, streaming: Boolean = false) {
         val extractor = MediaExtractor()
         var codec: MediaCodec? = null
+        var dataSource: GrowingFileDataSource? = null
         var sawInputEos = false
         var outputDone = false
         val info = MediaCodec.BufferInfo()
@@ -466,7 +477,12 @@ class UsbExclusiveAudioEngine(
         var packetizer: PcmIsoPacketizer? = null
 
         try {
-            extractor.setDataSource(file.absolutePath)
+            if (streaming) {
+                dataSource = GrowingFileDataSource(file, RandomAccessFile(file, "r"))
+                extractor.setDataSource(dataSource)
+            } else {
+                extractor.setDataSource(file.absolutePath)
+            }
             val trackIndex = findAudioTrack(extractor)
             if (trackIndex < 0) {
                 emitError("No audio track was found in ${file.name}.")
@@ -686,9 +702,61 @@ class UsbExclusiveAudioEngine(
             }
             codec?.release()
             extractor.release()
+            runCatching { dataSource?.close() }
             UsbExclusiveNative.close()
             connection?.close()
             connection = null
+        }
+    }
+
+    /**
+     * 流式独占的数据源：文件仍在下载增长中。读到未下载区域时等数据，
+     * 解码线程随之停在 readSampleData 上，USB 端表现与用户暂停一致（不爆音）；
+     * 恢复要求多攒一段余量，避免走走停停。下载完成时 Dart 侧把 .part 改名为
+     * 正式缓存名，已打开的 fd 不受影响，据"原路径消失"判断下载结束。
+     */
+    private inner class GrowingFileDataSource(
+        private val partFile: File,
+        private val input: RandomAccessFile,
+    ) : MediaDataSource() {
+        private val rebufferBytes = 256L * 1024L
+        private var bufferingLogged = false
+
+        override fun readAt(position: Long, buffer: ByteArray, offset: Int, size: Int): Int {
+            if (size <= 0) {
+                return 0
+            }
+            var required = position + size
+            while (!stopped.get()) {
+                val complete = !partFile.exists()
+                val length = input.length()
+                if (complete || length >= required) {
+                    if (position >= length) {
+                        return -1
+                    }
+                    input.seek(position)
+                    return input.read(buffer, offset, minOf(size.toLong(), length - position).toInt())
+                }
+                if (!bufferingLogged) {
+                    bufferingLogged = true
+                    UsbDiagnostics.i(
+                        tag,
+                        "streaming source buffering: need=${position + size}, have=$length",
+                    )
+                }
+                required = position + size + rebufferBytes
+                Thread.sleep(50)
+            }
+            return -1
+        }
+
+        override fun getSize(): Long {
+            // 下载没结束时总大小未知；MediaExtractor 对顺序解码可以接受 -1
+            return if (partFile.exists()) -1L else input.length()
+        }
+
+        override fun close() {
+            input.close()
         }
     }
 
@@ -699,8 +767,11 @@ class UsbExclusiveAudioEngine(
      * 关键约束：DoP 路径上不允许任何 DSP（音量/抖动/重采样都会破坏标记、输出全幅噪声）；
      * 暂停时必须持续发 DoP 封装的 0x69 静音——发 PCM 零或停流会让 DAC 掉出 DSD 模式并可能爆音。
      */
-    private fun dopDecodeAndWrite(reader: DsdFileReader, target: OutputTarget) {
+    private fun dopDecodeAndWrite(reader: DsdFileReader, target: OutputTarget, streamingFile: File? = null) {
         var lastPositionEmitMs = 0L
+        // 流式下载中的缓冲恢复水位：饥饿后攒到该长度才继续读，避免走走停停
+        var streamingResumeBytes = 0L
+        var streamingBufferingLogged = false
         val dop = DopPacketizer(reader.channels)
         try {
             val packetizer = createPacketizer(reader.dopFrameRate, reader.channels, 24, target)
@@ -743,6 +814,30 @@ class UsbExclusiveAudioEngine(
                 if (paused.get()) {
                     packetizer.write(dop.encodeSilence(silenceFramesPerWrite))
                     continue
+                }
+
+                // 流式下载：数据没跟上时垫 DoP 静音等下载，保持 DAC 停留在 DSD
+                // 模式（DoP 绝不能断流，断点样本也不能修改，只能发 0x69）
+                if (streamingFile != null && streamingFile.exists()) {
+                    val length = streamingFile.length()
+                    val ready = reader.canReadAt(length) &&
+                        (streamingResumeBytes == 0L || length >= streamingResumeBytes)
+                    if (!ready) {
+                        if (streamingResumeBytes == 0L) {
+                            streamingResumeBytes = length + 256L * 1024L
+                        }
+                        if (!streamingBufferingLogged) {
+                            streamingBufferingLogged = true
+                            UsbDiagnostics.i(
+                                tag,
+                                "DoP streaming buffering at ${reader.positionMs}ms, have=$length",
+                            )
+                        }
+                        packetizer.write(dop.encodeSilence(silenceFramesPerWrite))
+                        continue
+                    }
+                    streamingResumeBytes = 0L
+                    streamingBufferingLogged = false
                 }
 
                 val count = reader.read(buffer)

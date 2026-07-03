@@ -374,6 +374,9 @@ class UsbExclusivePlaybackRequest {
   final int? targetBufferMs;
   final bool startPaused;
 
+  /// filePath 是仍在下载增长中的 .part 缓存文件（流式独占）
+  final bool streaming;
+
   const UsbExclusivePlaybackRequest({
     required this.filePath,
     required this.title,
@@ -383,6 +386,7 @@ class UsbExclusivePlaybackRequest {
     this.dsdMode,
     required this.targetBufferMs,
     required this.startPaused,
+    this.streaming = false,
   });
 
   Map<String, Object?> toMap() {
@@ -395,6 +399,7 @@ class UsbExclusivePlaybackRequest {
       'dsdMode': dsdMode,
       'targetBufferMs': targetBufferMs,
       'startPaused': startPaused,
+      'streaming': streaming,
     };
   }
 }

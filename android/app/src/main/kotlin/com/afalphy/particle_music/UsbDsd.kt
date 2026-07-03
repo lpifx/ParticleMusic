@@ -131,6 +131,33 @@ class DsdFileReader private constructor(
     }
 
     /**
+     * 流式下载中调用：按当前已下载的文件长度 [fileLength] 判断下一次 [read]
+     * 能否交付数据而不把"数据还没下到"误判成文件结尾。
+     * DSF 要求下一个块组所需字节齐全（避免半块重复交付），DFF 只要求至少一帧。
+     * 已到真实结尾时返回 true，让 [read] 正常返回 -1。
+     */
+    fun canReadAt(fileLength: Long): Boolean {
+        if (positionBytesPerChannel >= bytesPerChannel) {
+            return true
+        }
+        if (blockSizePerChannel > 0) {
+            if (chunkOffset < chunkLength) {
+                return true
+            }
+            val valid = (bytesPerChannel - loadedBytesPerChannel)
+                .coerceAtMost(blockSizePerChannel.toLong())
+            if (valid <= 0) {
+                return true
+            }
+            val groupStart = dataStart +
+                loadedBytesPerChannel / blockSizePerChannel * blockSizePerChannel * channels
+            // planar 块组内最后一个声道的段也要够 valid 字节
+            return fileLength >= groupStart + (channels - 1).toLong() * blockSizePerChannel + valid
+        }
+        return fileLength >= dataStart + (positionBytesPerChannel + 1) * channels
+    }
+
+    /**
      * 定位到 [positionMs] 附近：DSF 对齐到块边界，DFF 对齐到 DoP 双字节边界。
      * 返回对齐后的实际位置（毫秒），用于进度上报。
      */
@@ -168,14 +195,19 @@ class DsdFileReader private constructor(
             reversed.toByte()
         }
 
-        fun open(file: File): DsdFileReader {
+        /**
+         * [streaming] 为 true 表示文件还在下载增长中：DFF 的数据大小按 chunk 头
+         * 声明值取（此刻文件长度不足以作截断依据），可读进度由调用方配合
+         * [canReadAt] 控制。
+         */
+        fun open(file: File, streaming: Boolean = false): DsdFileReader {
             val input = RandomAccessFile(file, "r")
             try {
                 val magic = ByteArray(4)
                 input.readFully(magic)
                 return when (String(magic, Charsets.US_ASCII)) {
                     "DSD " -> openDsf(input)
-                    "FRM8" -> openDff(input)
+                    "FRM8" -> openDff(input, streaming)
                     else -> throw IOException("Not a DSF/DFF file.")
                 }
             } catch (error: Throwable) {
@@ -241,7 +273,7 @@ class DsdFileReader private constructor(
             )
         }
 
-        private fun openDff(input: RandomAccessFile): DsdFileReader {
+        private fun openDff(input: RandomAccessFile, streaming: Boolean = false): DsdFileReader {
             val formSize = input.readLongBe()
             val formType = ByteArray(4)
             input.readFully(formType)
@@ -301,7 +333,8 @@ class DsdFileReader private constructor(
                     "Invalid DFF: sampleRate=$sampleRate, channels=$channels, hasData=${dataStart >= 0}",
                 )
             }
-            val audioBytes = minOf(dataSize, input.length() - dataStart)
+            // 流式下载中文件长度还在增长，数据大小只信 chunk 头声明值
+            val audioBytes = if (streaming) dataSize else minOf(dataSize, input.length() - dataStart)
             input.seek(dataStart)
             return DsdFileReader(
                 input = input,

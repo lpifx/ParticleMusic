@@ -334,6 +334,11 @@ class Library {
   Future<void> _downloadCache(MyAudioMetadata song, String savePath) async {
     // 先下到临时文件再改名：下载中断留下的半截文件不会被当成完整缓存
     final partPath = '$savePath.part';
+    final stale = File(partPath);
+    // 清掉上次中断的残留，避免流式独占把旧数据当成新下载的起播水位
+    if (await stale.exists()) {
+      await stale.delete();
+    }
     if (song.sourceType == .webdav) {
       await webdavClient!.download(remotePath: song.path!, localPath: partPath);
     } else if (song.sourceType == .navidrome) {

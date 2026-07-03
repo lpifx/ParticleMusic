@@ -17,6 +17,7 @@
 | DSD 模式和 DSD 转 PCM 采样率 | 部分接入 | `.dsf/.dff` 已进曲库（`dsd_metadata.dart` 手工解析头部与 DSF 尾部 ID3）。`PCM` 模式：DSD 文件不进独占，由共享路径（mpv）解码转 PCM，DSD64/128/256/512 转 PCM 目标采样率作为系统 preferred output 请求生效。`DoP` 模式：独占链路已实现（`DsdFileReader`→`DopPacketizer`→ISO 打包，时钟设为 DSD 速率÷16，需设备提供 24/32-bit alt），暂停发 DoP 封装的 0x69 静音、seek 丢弃在途 URB。`Native` 暂未实现，选中时引擎报不支持并回退。 |
 | 音量锁定和 DSD 增益补偿 | 已接入偏好 | 设置已持久化，供播放链路读取；硬件音量实时检测暂未接入。 |
 | DAC quirk 配置 | 已接入 | 内置 `assets/usb_dac_quirks.json` + 本地 override（设置页"导入 quirk 配置"粘贴 JSON），`vid:pid` 精确 → `vid:*` 厂商 → 默认三级匹配。当前生效字段：`dop.supported/maxDsd`（DoP 判定）、`clock.setCurDelayMs/skipGetCurValidation`（时钟配置）；`nativeDsd.*` 已解析、待 Native DSD 实现后接入。诊断报告含 quirk 匹配结果与加载错误。 |
+| 云端来源独占策略 | 已接入（待真机验证） | Navidrome/WebDAV/Emby 未缓存曲目：后台下载缓存，约 10 秒水位且下载速度跟得上时用 `.part` 文件流式独占（引擎按增长中的文件读取，数据没跟上时 PCM 按暂停处理、DoP 垫 0x69 静音，不断流不爆音）；4 秒内达不到水位回退共享流式立即出声。独占开启时预取队列下一首云端歌曲，连播场景直接整首缓存走独占。 |
 
 ## 参考或占位项
 

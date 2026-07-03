@@ -777,11 +777,6 @@ class MyAudioHandler extends BaseAudioHandler with WidgetsBindingObserver {
       return false;
     }
 
-    final filePath = await _exclusivePlayablePath(song);
-    if (filePath == null) {
-      return false;
-    }
-
     // DSD 走 DoP 时输出帧率由引擎按文件头计算（DSD 速率 ÷ 16），不做采样率白名单校验
     final exclusiveSampleRate = isDsd
         ? null
@@ -796,6 +791,13 @@ class MyAudioHandler extends BaseAudioHandler with WidgetsBindingObserver {
       );
       return false;
     }
+
+    final filePath = await _exclusivePlayablePath(song, generation: generation);
+    if (filePath == null) {
+      return false;
+    }
+    // .part 表示缓存还在下载中，走流式独占（引擎按增长中的文件读取）
+    final streaming = filePath.endsWith('.part');
 
     if (generation != null && generation != _loadGeneration) {
       // 权限弹窗/路径解析期间用户已切到别的歌，放弃启动独占
@@ -814,6 +816,7 @@ class MyAudioHandler extends BaseAudioHandler with WidgetsBindingObserver {
           WidgetsBinding.instance.lifecycleState,
         ),
         startPaused: !isPlayingNotifier.value,
+        streaming: streaming,
       ),
     );
 
@@ -865,7 +868,10 @@ class MyAudioHandler extends BaseAudioHandler with WidgetsBindingObserver {
     return null;
   }
 
-  Future<String?> _exclusivePlayablePath(MyAudioMetadata song) async {
+  Future<String?> _exclusivePlayablePath(
+    MyAudioMetadata song, {
+    int? generation,
+  }) async {
     if (song.sourceType == .local && song.path != null) {
       return await convertToRealPathIfNeed(song.path!) ?? song.path;
     }
@@ -874,15 +880,57 @@ class MyAudioHandler extends BaseAudioHandler with WidgetsBindingObserver {
       return song.cachePath;
     }
 
-    // 云端歌曲未缓存时不阻塞等整首下载：本次先走共享流式立即出声，
-    // 后台缓存完成后，之后再播这首即可走独占
+    // 云端歌曲未缓存：后台下载缓存，短暂等到够起播的水位就用 .part
+    // 文件流式独占；等不到则回退共享流式立即出声，不阻塞整首下载
     unawaited(
       library.tryAddCache(song).catchError((Object error) {
         logger.output("usb exclusive cache failed:$error");
       }),
     );
-    logger.output("usb exclusive skipped:cloud song not cached -> streaming");
-    debugPrint("usb exclusive skipped:cloud song not cached -> streaming");
+
+    final format = _normalizedExclusiveFormat(song);
+    if (format != 'flac' &&
+        format != 'wav' &&
+        format != 'dsf' &&
+        format != 'dff') {
+      // 独占不支持的格式，没必要等水位
+      return null;
+    }
+
+    final partPath = '${song.cachePath!}.part';
+    // 起播水位：约 10 秒的数据量（码率未知按 2 Mbps 估算）
+    final bytesPerSecond =
+        ((song.bitrate ?? 0) > 0 ? song.bitrate! : 2000) * 1000 ~/ 8;
+    final startBytes = bytesPerSecond * 10;
+    final deadline = DateTime.now().add(Duration(seconds: 4));
+    var lastSize = -1;
+    while (DateTime.now().isBefore(deadline)) {
+      if (generation != null && generation != _loadGeneration) {
+        return null;
+      }
+      if (song.cacheExist && song.cachePath != null) {
+        return song.cachePath; // 等待期间下载已完成
+      }
+      final part = File(partPath);
+      final size = part.existsSync() ? part.lengthSync() : 0;
+      // 水位够且下载速度跟得上播放（一轮 200ms 内至少推进等量数据）才起播；
+      // 必须有一次真实的增量测量，避免把上次中断的 .part 残留当成有效水位
+      if (lastSize >= 0 &&
+          size >= startBytes &&
+          size - lastSize >= bytesPerSecond ~/ 5) {
+        logger.output(
+          "usb exclusive streaming start:part=$size bytes, watermark=$startBytes",
+        );
+        debugPrint(
+          "usb exclusive streaming start:part=$size bytes, watermark=$startBytes",
+        );
+        return partPath;
+      }
+      lastSize = size;
+      await Future.delayed(Duration(milliseconds: 200));
+    }
+    logger.output("usb exclusive skipped:below streaming watermark -> shared");
+    debugPrint("usb exclusive skipped:below streaming watermark -> shared");
     return null;
   }
 

@@ -275,6 +275,7 @@ void main() {
         'dsdMode': null,
         'targetBufferMs': 320,
         'startPaused': false,
+        'streaming': false,
       });
       expect(state.active, isTrue);
       expect(state.playing, isTrue);
