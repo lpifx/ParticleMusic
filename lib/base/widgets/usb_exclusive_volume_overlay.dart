@@ -6,12 +6,11 @@ import 'package:sylvakru/base/app.dart';
 import 'package:sylvakru/base/audio_handler.dart';
 import 'package:sylvakru/base/services/color_manager.dart';
 import 'package:sylvakru/base/services/usb_audio_service.dart';
-import 'package:sylvakru/l10n/generated/app_localizations.dart';
 
-/// 独占模式下按安卓物理音量键时弹出的右侧竖向毛玻璃音量面板：显示音量、可拖动竖滑条
-/// 调节、底部静音键，静止约 2 秒后自动隐藏。系统音量条已被 MainActivity 拦截，改由本
-/// 面板反馈与操作。叠在 MaterialApp 之上（需 Stack 父级），只在收到物理音量键事件时
-/// 显示。DSD 独占不会触发（1-bit 码流无法软件调音量，引擎侧不接管音量键）。
+/// 独占模式下按安卓物理音量键时弹出的右侧竖向毛玻璃音量条：整条可点/拖调节，百分比
+/// 直接显示在条内（双色随填充自适应，任何主题都可读），静止约 2 秒后自动隐藏。系统音量
+/// 条已被 MainActivity 拦截，改由本条反馈与操作。叠在 MaterialApp 之上（需 Stack 父级），
+/// 只在收到物理音量键事件时显示。DSD 独占不会触发（1-bit 码流无法软件调音量）。
 class UsbExclusiveVolumeOverlay extends StatefulWidget {
   const UsbExclusiveVolumeOverlay({super.key});
 
@@ -23,7 +22,6 @@ class UsbExclusiveVolumeOverlay extends StatefulWidget {
 class _UsbExclusiveVolumeOverlayState extends State<UsbExclusiveVolumeOverlay> {
   bool _visible = false;
   Timer? _hideTimer;
-  double _lastNonZeroVolume = 0.3;
 
   @override
   void initState() {
@@ -38,7 +36,7 @@ class _UsbExclusiveVolumeOverlayState extends State<UsbExclusiveVolumeOverlay> {
     super.dispose();
   }
 
-  // 显示并重置自动隐藏计时；拖动滑条或点静音时也调用它保持常驻。
+  // 显示并重置自动隐藏计时；拖动时也调用它保持常驻。
   void _show() {
     _hideTimer?.cancel();
     _hideTimer = Timer(const Duration(seconds: 2), () {
@@ -50,7 +48,6 @@ class _UsbExclusiveVolumeOverlayState extends State<UsbExclusiveVolumeOverlay> {
   }
 
   void _applyVolume(double next) {
-    if (next > 0) _lastNonZeroVolume = next;
     volumeNotifier.value = next;
     audioHandler.setVolume(next);
     _show();
@@ -59,8 +56,8 @@ class _UsbExclusiveVolumeOverlayState extends State<UsbExclusiveVolumeOverlay> {
   @override
   Widget build(BuildContext context) {
     final media = MediaQuery.of(context);
-    // 固定尺寸避免被松约束撑爆：右侧竖条，高度取屏高一半并封顶。
-    final height = (media.size.height * 0.5).clamp(360.0, 520.0);
+    // 固定尺寸避免被松约束撑爆：右侧窄竖条，高度取屏高四成并封顶。
+    final height = (media.size.height * 0.4).clamp(280.0, 420.0);
     return Positioned.fill(
       child: IgnorePointer(
         ignoring: !_visible,
@@ -77,7 +74,7 @@ class _UsbExclusiveVolumeOverlayState extends State<UsbExclusiveVolumeOverlay> {
                 alignment: Alignment.centerRight,
                 child: Padding(
                   padding: const EdgeInsets.only(right: 12),
-                  child: SizedBox(width: 84, height: height, child: _panel()),
+                  child: SizedBox(width: 50, height: height, child: _bar()),
                 ),
               ),
             ),
@@ -87,71 +84,39 @@ class _UsbExclusiveVolumeOverlayState extends State<UsbExclusiveVolumeOverlay> {
     );
   }
 
-  Widget _panel() {
+  Widget _bar() {
     return ValueListenableBuilder<ThemeType>(
       valueListenable: mainPageThemeNotifier,
       builder: (context, theme, _) {
         return ValueListenableBuilder<double>(
           valueListenable: volumeNotifier,
           builder: (context, volume, _) {
-            final accent = iconColor.value;
+            final accent = iconColor.value; // 填充色，走作者单色范式
             final clamped = volume.clamp(0.0, 1.0);
             final percent = (clamped * 100).round();
-            final muted = clamped <= 0;
             final dark = theme == ThemeType.dark;
+            // 未填充区（面板底色）上的数字取 textColor；填充区（accent）上的数字取
+            // 面板色反白，两者均随主题联动，避免任一音量下看不清。
+            final onGroove = textColor.value;
+            final onFill = panelColor.value.withAlpha(255);
             return ClipRRect(
-              borderRadius: BorderRadius.circular(42),
+              borderRadius: BorderRadius.circular(25),
               child: BackdropFilter(
-                filter: ImageFilter.blur(sigmaX: 24, sigmaY: 24),
+                filter: ImageFilter.blur(sigmaX: 20, sigmaY: 20),
                 child: DecoratedBox(
                   decoration: BoxDecoration(
                     color: panelColor.value.withAlpha(dark ? 205 : 235),
-                    borderRadius: BorderRadius.circular(42),
+                    borderRadius: BorderRadius.circular(25),
                     border: Border.all(color: textColor.value.withAlpha(20)),
                     boxShadow: [
                       BoxShadow(
-                        color: Colors.black.withAlpha(dark ? 80 : 30),
-                        blurRadius: 24,
-                        offset: const Offset(0, 8),
+                        color: Colors.black.withAlpha(dark ? 70 : 26),
+                        blurRadius: 18,
+                        offset: const Offset(0, 6),
                       ),
                     ],
                   ),
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 16),
-                    child: Column(
-                      children: [
-                        Icon(
-                          muted
-                              ? Icons.volume_off_rounded
-                              : Icons.volume_up_rounded,
-                          color: accent,
-                          size: 24,
-                        ),
-                        const SizedBox(height: 10),
-                        Text(
-                          AppLocalizations.of(context).volumeSection,
-                          style: TextStyle(
-                            color: textColor.value.withAlpha(140),
-                            fontSize: 11,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                        const SizedBox(height: 2),
-                        Text(
-                          '$percent%',
-                          style: TextStyle(
-                            color: highlightTextColor.value,
-                            fontSize: 17,
-                            fontWeight: FontWeight.w800,
-                          ),
-                        ),
-                        const SizedBox(height: 14),
-                        Expanded(child: _fillBar(accent, clamped, dark)),
-                        const SizedBox(height: 14),
-                        _muteButton(accent, muted, dark),
-                      ],
-                    ),
-                  ),
+                  child: _track(accent, clamped, percent, onGroove, onFill),
                 ),
               ),
             );
@@ -161,9 +126,20 @@ class _UsbExclusiveVolumeOverlayState extends State<UsbExclusiveVolumeOverlay> {
     );
   }
 
-  // iOS 风格竖向填充胶囊条：整块作为触控区，按落点/拖动位置直接换算音量并下发，
-  // 避免旋转 Slider 的手势失灵。填充色取主题 iconColor，凹槽用 textColor 淡色。
-  Widget _fillBar(Color accent, double value, bool dark) {
+  // 整条即触控区：按点击/拖动纵向落点直接换算音量并下发，避免旋转 Slider 手势失灵。
+  Widget _track(
+    Color accent,
+    double value,
+    int percent,
+    Color onGroove,
+    Color onFill,
+  ) {
+    const style = TextStyle(
+      fontSize: 12.5,
+      fontWeight: FontWeight.w700,
+      decoration: TextDecoration.none,
+    );
+    final label = '$percent%';
     return LayoutBuilder(
       builder: (context, constraints) {
         final trackHeight = constraints.maxHeight;
@@ -175,56 +151,51 @@ class _UsbExclusiveVolumeOverlayState extends State<UsbExclusiveVolumeOverlay> {
         return GestureDetector(
           behavior: HitTestBehavior.opaque,
           onTapDown: (details) => updateFromDy(details.localPosition.dy),
+          onTapUp: (_) => audioHandler.savePlayState(),
           onVerticalDragStart: (details) =>
               updateFromDy(details.localPosition.dy),
           onVerticalDragUpdate: (details) =>
               updateFromDy(details.localPosition.dy),
           onVerticalDragEnd: (_) => audioHandler.savePlayState(),
-          onTapUp: (_) => audioHandler.savePlayState(),
-          child: Center(
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(20),
-              child: Container(
-                width: 46,
-                height: trackHeight,
-                color: textColor.value.withAlpha(dark ? 34 : 22),
-                child: Align(
-                  alignment: Alignment.bottomCenter,
-                  child: FractionallySizedBox(
-                    heightFactor: value,
-                    widthFactor: 1,
-                    child: DecoratedBox(
-                      decoration: BoxDecoration(color: accent),
-                    ),
-                  ),
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              Align(
+                alignment: Alignment.bottomCenter,
+                child: FractionallySizedBox(
+                  heightFactor: value,
+                  widthFactor: 1,
+                  child: DecoratedBox(decoration: BoxDecoration(color: accent)),
                 ),
               ),
-            ),
+              Center(child: Text(label, style: style.copyWith(color: onGroove))),
+              ClipRect(
+                clipper: _BottomFractionClipper(value),
+                child: Center(
+                  child: Text(label, style: style.copyWith(color: onFill)),
+                ),
+              ),
+            ],
           ),
         );
       },
     );
   }
+}
 
-  Widget _muteButton(Color accent, bool muted, bool dark) {
-    return GestureDetector(
-      onTap: () {
-        _applyVolume(muted ? _lastNonZeroVolume : 0.0);
-        audioHandler.savePlayState();
-      },
-      child: Container(
-        width: 46,
-        height: 46,
-        decoration: BoxDecoration(
-          shape: BoxShape.circle,
-          color: textColor.value.withAlpha(dark ? 30 : 18),
-        ),
-        child: Icon(
-          Icons.volume_off_rounded,
-          color: muted ? accent : textColor.value.withAlpha(170),
-          size: 22,
-        ),
-      ),
-    );
+// 裁出底部 fraction 高度的区域，用于让填充区内的数字换成反白色。
+class _BottomFractionClipper extends CustomClipper<Rect> {
+  const _BottomFractionClipper(this.fraction);
+
+  final double fraction;
+
+  @override
+  Rect getClip(Size size) {
+    return Rect.fromLTRB(0, size.height * (1 - fraction), size.width, size.height);
+  }
+
+  @override
+  bool shouldReclip(_BottomFractionClipper oldClipper) {
+    return oldClipper.fraction != fraction;
   }
 }
