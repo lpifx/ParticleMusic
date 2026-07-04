@@ -8,6 +8,7 @@ import android.hardware.usb.UsbEndpoint
 import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
 import android.media.MediaCodec
+import android.media.MediaCodecList
 import android.media.MediaDataSource
 import android.media.MediaExtractor
 import android.media.MediaFormat
@@ -192,7 +193,7 @@ class UsbExclusiveAudioEngine(
         )
 
         if (!isSupportedFile(filePath, sourceFormat)) {
-            return updateState(inactiveState("Exclusive playback currently supports FLAC, WAV and DSD (.dsf/.dff) only."))
+            return updateState(inactiveState("This audio format cannot be decoded for USB exclusive playback."))
         }
 
         // 流式独占：file 是仍在下载增长的 .part 文件，下载完成时会被改名为正式
@@ -2124,7 +2125,12 @@ class UsbExclusiveAudioEngine(
         }
     }
 
+    // 系统 MediaExtractor 支持、可边下边播（流式独占）的常见有损容器扩展名。
+    // 与 Dart 侧 _exclusivePlayablePath 的流式白名单保持一致；wv/ape 等系统不支持的不在此列。
+    private val streamableLossyExts = setOf("mp3", "m4a", "m4b", "mp4", "aac", "ogg", "oga", "opus")
+
     private fun isSupportedFile(filePath: String, sourceFormat: String?): Boolean {
+        // 已知无损容器与 DSD 直接放行（含仍在下载的 .part 流式无损），零探测开销
         if (sourceFormat == "flac" || sourceFormat == "wav" || sourceFormat == "wave") {
             return true
         }
@@ -2132,7 +2138,54 @@ class UsbExclusiveAudioEngine(
             return true
         }
         val lower = filePath.lowercase(Locale.ROOT)
-        return lower.endsWith(".flac") || lower.endsWith(".wav") || lower.endsWith(".wave")
+        // 流式独占：file 仍在下载增长（xxx.ext.part），按真实扩展名判定，不剥 .part 会误判
+        val streaming = lower.endsWith(".part")
+        val effective = if (streaming) lower.removeSuffix(".part") else lower
+        if (effective.endsWith(".flac") || effective.endsWith(".wav") || effective.endsWith(".wave")) {
+            return true
+        }
+        if (streaming) {
+            // 下载中文件无法完整探测：按扩展名放行系统可流式解码的有损容器（mp3/m4a/ogg 等），
+            // 与 FLAC 流式独占同等对待；wv/ape 等系统不支持的不会以 .part 走到这里。
+            val ext = effective.substringAfterLast('.', "")
+            return ext in streamableLossyExts
+        }
+        // 完整文件的其余格式（m4a/AAC、mp3、ogg 等）以系统解码器能力为准：MediaCodec 能解出 PCM
+        // 就走独占直驱；系统解不了的容器（WavPack/APE 等）判为不支持，交由 Dart 侧回退共享输出——
+        // 绝不能进独占后 worker 线程再异步失败导致无声。
+        return isMediaCodecDecodable(filePath)
+    }
+
+    /// 用 MediaExtractor + MediaCodecList 探测文件能否被系统解码器解成 PCM。
+    /// 只查解码器可用性、不实例化 codec，保守判定：宁可返回 false 回退共享，也不误放导致独占无声。
+    private fun isMediaCodecDecodable(filePath: String): Boolean {
+        val extractor = MediaExtractor()
+        return try {
+            extractor.setDataSource(filePath)
+            val trackIndex = findAudioTrack(extractor)
+            if (trackIndex < 0) {
+                return false
+            }
+            val format = extractor.getTrackFormat(trackIndex)
+            val mime = format.getString(MediaFormat.KEY_MIME) ?: return false
+            // 原始 PCM（如 WAV）由 writeRawPcm 直通，无需解码器
+            if (mime == "audio/raw") {
+                return true
+            }
+            val decoder = MediaCodecList(MediaCodecList.REGULAR_CODECS)
+                .findDecoderForFormat(format)
+            val decodable = decoder != null
+            UsbDiagnostics.i(tag, "decodability probe file=$filePath, mime=$mime, decoder=${decoder ?: "none"}")
+            decodable
+        } catch (error: Exception) {
+            UsbDiagnostics.w(tag, "decodability probe failed for $filePath: ${error.message}")
+            false
+        } finally {
+            try {
+                extractor.release()
+            } catch (_: Throwable) {
+            }
+        }
     }
 
     private fun isDsdFile(filePath: String, sourceFormat: String?): Boolean {

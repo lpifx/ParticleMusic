@@ -911,12 +911,16 @@ class MyAudioHandler extends BaseAudioHandler with WidgetsBindingObserver {
       }),
     );
 
-    final format = _normalizedExclusiveFormat(song);
-    if (format != 'flac' &&
-        format != 'wav' &&
-        format != 'dsf' &&
-        format != 'dff') {
-      // 独占不支持的格式，没必要等水位
+    // 能边下边播（流式独占）的格式：无损/DSD + 系统可流式解码的常见有损容器。
+    // wv/ape 等系统无解码器的不在此列，未缓存时先走共享出声，缓存完成后再走独占。
+    // 与原生 UsbExclusiveAudioEngine.streamableLossyExts 保持一致。
+    const streamableExts = {
+      'flac', 'wav', 'wave', 'dsf', 'dff',
+      'mp3', 'm4a', 'm4b', 'mp4', 'aac', 'ogg', 'oga', 'opus',
+    };
+    final ext = (song.cachePath ?? '').toLowerCase().split('.').last;
+    if (!streamableExts.contains(ext)) {
+      // 独占无法流式的格式，没必要等水位
       return null;
     }
 
