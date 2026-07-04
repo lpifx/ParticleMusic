@@ -6,9 +6,10 @@ import 'package:sylvakru/base/audio_handler.dart';
 import 'package:sylvakru/base/services/color_manager.dart';
 import 'package:sylvakru/base/services/usb_audio_service.dart';
 
-/// 独占模式下按安卓物理音量键时弹出的悬浮音量窗口：显示当前音量并可手动拖动调节，
-/// 静止约 2 秒后自动隐藏。系统音量条已被 MainActivity 拦截，改由本窗口反馈与操作。
+/// 独占模式下按安卓物理音量键时弹出的悬浮音量条：显示当前音量并可手动拖动调节，
+/// 静止约 2 秒后自动隐藏。系统音量条已被 MainActivity 拦截，改由本条反馈与操作。
 /// 叠在 MaterialApp 之上（需 Stack 父级），只在收到物理音量键事件时显示。
+/// DSD 独占不会触发（1-bit 码流无法软件调音量，引擎侧不接管音量键）。
 class UsbExclusiveVolumeOverlay extends StatefulWidget {
   const UsbExclusiveVolumeOverlay({super.key});
 
@@ -34,7 +35,7 @@ class _UsbExclusiveVolumeOverlayState extends State<UsbExclusiveVolumeOverlay> {
     super.dispose();
   }
 
-  // 显示窗口并重置自动隐藏计时；拖动滑条时也调用它保持窗口常驻。
+  // 显示并重置自动隐藏计时；拖动滑条时也调用它保持常驻。
   void _show() {
     _hideTimer?.cancel();
     _hideTimer = Timer(const Duration(seconds: 2), () {
@@ -47,25 +48,32 @@ class _UsbExclusiveVolumeOverlayState extends State<UsbExclusiveVolumeOverlay> {
 
   @override
   Widget build(BuildContext context) {
-    final media = MediaQuery.of(context);
-    // 适配窗口宽度：手机竖屏留边、横屏与桌面大窗封顶 360，始终水平居中顶部。
-    final width = (media.size.width - 32).clamp(0.0, 360.0);
-    return Positioned(
-      top: media.padding.top + 16,
-      left: 0,
-      right: 0,
+    // 铺满屏幕的透明层，隐藏时忽略指针；内容只在顶部居中一条，随窗口宽度自适应。
+    return Positioned.fill(
       child: IgnorePointer(
         ignoring: !_visible,
         child: AnimatedOpacity(
           opacity: _visible ? 1 : 0,
           duration: const Duration(milliseconds: 180),
-          child: Center(child: SizedBox(width: width, child: _card())),
+          curve: Curves.easeOut,
+          child: SafeArea(
+            child: Align(
+              alignment: Alignment.topCenter,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 360),
+                  child: _bar(),
+                ),
+              ),
+            ),
+          ),
         ),
       ),
     );
   }
 
-  Widget _card() {
+  Widget _bar() {
     return ValueListenableBuilder<ThemeType>(
       valueListenable: mainPageThemeNotifier,
       builder: (context, theme, _) {
@@ -75,68 +83,71 @@ class _UsbExclusiveVolumeOverlayState extends State<UsbExclusiveVolumeOverlay> {
           builder: (context, volume, _) {
             final clamped = volume.clamp(0.0, 1.0);
             final percent = (clamped * 100).round();
-            return DecoratedBox(
+            return Container(
+              padding: const EdgeInsets.fromLTRB(14, 6, 12, 6),
               decoration: BoxDecoration(
                 color: menuColor.value,
-                borderRadius: BorderRadius.circular(16),
+                borderRadius: BorderRadius.circular(30),
                 boxShadow: [
                   BoxShadow(
                     color: Colors.black.withAlpha(
-                      theme == ThemeType.dark ? 90 : 40,
+                      theme == ThemeType.dark ? 110 : 45,
                     ),
-                    blurRadius: 18,
-                    offset: const Offset(0, 6),
+                    blurRadius: 22,
+                    offset: const Offset(0, 8),
                   ),
                 ],
               ),
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(16, 6, 14, 6),
-                child: Row(
-                  children: [
-                    Icon(
-                      percent == 0
-                          ? Icons.volume_off_rounded
-                          : percent < 50
-                          ? Icons.volume_down_rounded
-                          : Icons.volume_up_rounded,
-                      color: accent,
-                    ),
-                    const SizedBox(width: 6),
-                    Expanded(
-                      child: SliderTheme(
-                        data: SliderTheme.of(context).copyWith(
-                          activeTrackColor: accent,
-                          inactiveTrackColor: accent.withAlpha(40),
-                          thumbColor: accent,
-                          overlayColor: accent.withAlpha(30),
-                        ),
-                        child: Slider(
-                          value: clamped,
-                          min: 0,
-                          max: 1,
-                          onChanged: (next) {
-                            volumeNotifier.value = next;
-                            audioHandler.setVolume(next);
-                            _show();
-                          },
-                          onChangeEnd: (_) => audioHandler.savePlayState(),
+              child: Row(
+                children: [
+                  Icon(
+                    percent == 0
+                        ? Icons.volume_off_rounded
+                        : percent < 50
+                        ? Icons.volume_down_rounded
+                        : Icons.volume_up_rounded,
+                    color: accent,
+                    size: 22,
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: SliderTheme(
+                      data: SliderTheme.of(context).copyWith(
+                        trackHeight: 3,
+                        activeTrackColor: accent,
+                        inactiveTrackColor: accent.withAlpha(40),
+                        thumbColor: accent,
+                        overlayColor: accent.withAlpha(30),
+                        thumbShape: const RoundSliderThumbShape(
+                          enabledThumbRadius: 7,
                         ),
                       ),
-                    ),
-                    const SizedBox(width: 4),
-                    SizedBox(
-                      width: 42,
-                      child: Text(
-                        '$percent%',
-                        textAlign: TextAlign.end,
-                        style: TextStyle(
-                          color: textColor.value.withAlpha(200),
-                          fontWeight: FontWeight.w700,
-                        ),
+                      child: Slider(
+                        value: clamped,
+                        min: 0,
+                        max: 1,
+                        onChanged: (next) {
+                          volumeNotifier.value = next;
+                          audioHandler.setVolume(next);
+                          _show();
+                        },
+                        onChangeEnd: (_) => audioHandler.savePlayState(),
                       ),
                     ),
-                  ],
-                ),
+                  ),
+                  const SizedBox(width: 4),
+                  SizedBox(
+                    width: 42,
+                    child: Text(
+                      '$percent%',
+                      textAlign: TextAlign.end,
+                      style: TextStyle(
+                        color: textColor.value.withAlpha(200),
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                ],
               ),
             );
           },

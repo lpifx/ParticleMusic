@@ -560,9 +560,12 @@ class UsbExclusiveAudioEngine(
         UsbDiagnostics.i(tag, "set exclusive volume gainQ16=$pcmVolumeGainQ16, enabled=$enabled")
     }
 
-    // 是否应由本软件接管安卓物理音量键：独占播放中且非原始数字电平模式。
+    // 是否应由本软件接管安卓物理音量键：独占播放中、非原始数字电平模式，且非 DSD。
+    // DSD（DoP/原生，bitDepth=1）是位流无法软件调音量，交回系统避免弹出无效音量条。
     fun isVolumeControlEngaged(): Boolean =
-        currentState["active"] == true && volumeControlEnabled
+        currentState["active"] == true &&
+            volumeControlEnabled &&
+            currentState["bitDepth"] != 1
 
     fun setTargetBufferMs(value: Int): Map<String, Any?> {
         targetBufferMs = value.coerceIn(50, 5000)
