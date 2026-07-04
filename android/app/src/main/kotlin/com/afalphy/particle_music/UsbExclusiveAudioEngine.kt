@@ -1969,18 +1969,24 @@ class UsbExclusiveAudioEngine(
                         )
                     }
                     0x02 -> {
-                        if (length >= 6) {
-                            formats[key] = existing.copy(
-                                formatType = descriptors[offset + 3].toInt() and 0xff,
-                                subslotSize = descriptors[offset + 4].toInt() and 0xff,
-                                bitResolution = descriptors[offset + 5].toInt() and 0xff,
-                            )
-                        } else if (length >= 7) {
+                        // UAC1 Type-I 格式描述符比 UAC2 多一个 bNrChannels 字段、且带采样率表，
+                        // 描述符更长（length>=7）；UAC2 Type-I 固定 length=6。原实现两个分支判据
+                        // 顺序写反（先判 length>=6），导致 UAC1 描述符错误命中 UAC2 布局，把
+                        // bSubframeSize(2/3/4) 当成位深，16-bit 被当 2/3/4-bit 严重右移打成静音。
+                        if (length >= 7) {
+                            // UAC1: bFormatType, bNrChannels, bSubframeSize, bBitResolution, …
                             formats[key] = existing.copy(
                                 formatType = descriptors[offset + 3].toInt() and 0xff,
                                 channels = descriptors[offset + 4].toInt() and 0xff,
                                 subslotSize = descriptors[offset + 5].toInt() and 0xff,
                                 bitResolution = descriptors[offset + 6].toInt() and 0xff,
+                            )
+                        } else if (length >= 6) {
+                            // UAC2: bFormatType, bSubslotSize, bBitResolution
+                            formats[key] = existing.copy(
+                                formatType = descriptors[offset + 3].toInt() and 0xff,
+                                subslotSize = descriptors[offset + 4].toInt() and 0xff,
+                                bitResolution = descriptors[offset + 5].toInt() and 0xff,
                             )
                         }
                     }
@@ -2014,6 +2020,7 @@ class UsbExclusiveAudioEngine(
         var currentInterfaceSubclass = -1
         var terminalLink: Int? = null
         var firstClockSourceId: Int? = null
+        var hasClockSource = false
         val inputTerminalClockIds = mutableMapOf<Int, Int>()
         val outputTerminalClockIds = mutableMapOf<Int, Int>()
 
@@ -2032,6 +2039,7 @@ class UsbExclusiveAudioEngine(
                 val subtype = descriptors[offset + 2].toInt() and 0xff
                 when (subtype) {
                     0x0a -> {
+                        hasClockSource = true
                         if (length >= 4 && firstClockSourceId == null) {
                             firstClockSourceId = descriptors[offset + 3].toInt() and 0xff
                         }
@@ -2064,6 +2072,18 @@ class UsbExclusiveAudioEngine(
             }
 
             offset += length
+        }
+
+        // UAC1 设备没有 clock source 实体（描述符里不会出现 CLOCK_SOURCE，子类型 0x0a），
+        // 采样率必须通过端点 SET_CUR 设置（见 configureUsbAudioClock 的 UAC1 分支）。
+        // 下面的 terminal→clock 映射按 UAC2 布局解析，对 UAC1 会误读
+        // （把 INPUT_TERMINAL 的 bNrChannels 当成 clockSourceId），因此无 clock source 时直接返回 null。
+        if (!hasClockSource) {
+            UsbDiagnostics.i(
+                tag,
+                "no UAC2 clock source entity (UAC1 device); using endpoint SET_CUR.",
+            )
+            return null
         }
 
         val linkedTerminal = terminalLink
